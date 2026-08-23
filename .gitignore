@@ -7,7 +7,7 @@ __pycache__/
 *.so
 
 # Excels file with the data
-.xlsx
+*.xlsx
 
 # Distribution / packaging
 .Python
