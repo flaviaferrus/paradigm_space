@@ -92,13 +92,13 @@ EMPTY_DEFICIT = 0.95  # a cell counts as uncovered above this coverage deficit
 GRID = 13             # cells per axis in the 4D gap search
 
 CLUSTERS = {
-    "motor":    dict(label="motor control / OFC / AIF", color="#157F7F"),
-    "salience": dict(label="surprise / salience",       color="#C1425A"),
-    "bridge":   dict(label="salience during action",    color="#D2892A"),
+    "motor":    dict(label="motor control", color="#157F7F"),
+    "surprise": dict(label="environmental surprise",       color="#C1425A"),
+    "bridge":   dict(label="surprise during action",    color="#D2892A"),
     "thesis":   dict(label="thesis experiments",        color="#4B2E83"),
 }
 CLUSTER_OF_FILE = {
-    "saliency": "salience",
+    "saliency": "surprise",
     "unexpected + motor control": "bridge",
     "thesis": "thesis",
 }
@@ -322,7 +322,7 @@ def _cluster_of(file_, topic):
     if key in CLUSTER_OF_FILE:
         return CLUSTER_OF_FILE[key]
     if "salien" in key or "salien" in topic.lower():
-        return "salience"
+        return "surprise"
     return "motor"
 
 
@@ -487,13 +487,76 @@ def pushforward(df):
 
 
 # ---------------------------------------------------------------------------
-# 2b. clustering: does the corpus split the way the labels say it does?
+# 2b. clustering: do our cluters map to the tentative claimed literature?
 # ---------------------------------------------------------------------------
 #
-# The cluster column is a label the reviewer assigned. Whether the corpus actually
-# separates that way is a separate question, and one the geometry can answer.
+# Each paper came from a search from a specific literature. 
 # Everything here is numpy so the script keeps its dependency list; scipy is used
-# for Ward only if it happens to be importable.
+# for Ward (the hierarchical clustering)
+# Some metrics are computed here to test the statistical significance
+# of the clusters identified from the paradigm space. 
+########## 
+# To formally prove the bridge cluster is statistically 
+# distinct from both motor and surprise across all dimensions, 
+# we can add a multivariate analysis of variance (MANOVA) 
+# or pairwise distance permutation test.
+from statsmodels.multivariate.manova import MANOVA
+from scipy.spatial.distance import cdist
+
+from statsmodels.multivariate.manova import MANOVA
+
+def test_cluster_separation(sub_df, axes, group_col="cluster"):
+    """Evaluates MANOVA and pairwise multivariate separation."""
+    clean_df = sub_df.dropna(subset=axes).copy()
+    lines = []
+
+    # ---------------------------------------------------------
+    # 1. Multivariate Analysis of Variance (MANOVA)
+    # ---------------------------------------------------------
+    lines.append("\n=== MANOVA Test (Overall Cluster Separation) ===")
+    formula = f"{' + '.join(axes)} ~ {group_col}"
+    try:
+        maov = MANOVA.from_formula(formula, data=clean_df)
+        manova_summary = str(maov.mv_test())
+        lines.append(manova_summary)
+        print("\n=== MANOVA Test (Overall Cluster Separation) ===")
+        print(manova_summary)
+    except Exception as e:
+        err_msg = f"MANOVA could not be computed: {e}"
+        lines.append(err_msg)
+        print(err_msg)
+
+    # ---------------------------------------------------------
+    # 2. Pairwise Centroid Distances & Permutation p-values
+    # ---------------------------------------------------------
+    lines.append("\n=== Pairwise Centroid Distances & Permutation Tests ===")
+    print("\n=== Pairwise Centroid Distances & Permutation Tests ===")
+    
+    groups = [g for g in clean_df[group_col].unique() if pd.notna(g)]
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            g1 = clean_df[clean_df[group_col] == groups[i]][axes].to_numpy(float)
+            g2 = clean_df[clean_df[group_col] == groups[j]][axes].to_numpy(float)
+            
+            if len(g1) < 2 or len(g2) < 2:
+                continue
+                
+            obs_dist = np.linalg.norm(g1.mean(0) - g2.mean(0))
+            
+            # Permutation test on distance between centroids
+            pooled = np.vstack([g1, g2])
+            n1 = len(g1)
+            null_dists = []
+            for _ in range(1000):
+                np.random.shuffle(pooled)
+                null_dists.append(np.linalg.norm(pooled[:n1].mean(0) - pooled[n1:].mean(0)))
+                
+            p_val = (np.array(null_dists) >= obs_dist).mean()
+            line = f"{groups[i]:<14} vs {groups[j]:<14} | Centroid Distance: {obs_dist:.3f} | p = {p_val:.4f}"
+            lines.append(line)
+            print(line)
+
+    return "\n".join(lines) + "\n"
 
 def _kmeanspp(X, w, k, rng):
     idx = [rng.choice(len(X), p=w / w.sum())]
@@ -543,7 +606,12 @@ def ward_labels(X, k):
 
 
 def silhouette(X, lab):
-    """Mean silhouette. Ties on a lattice give zero-distance neighbours, so this is
+    """Mean silhouette. 
+    Silhouette Score: Evaluates whether clusters occupy distinct, 
+    separated regions in the multidimensional space 
+    (ranges [−1,1], with >0.35 indicating genuine geometric separation).
+
+    Ties on a lattice give zero-distance neighbours, so this is
     a conservative read: identical designs in different clusters are penalised."""
     D = np.sqrt(((X[:, None, :] - X[None, :, :]) ** 2).sum(-1))
     out = np.zeros(len(X))
@@ -623,7 +691,13 @@ def permutation_p(found, given, stat=adjusted_rand, n_perm=2000, seed=0):
 
 
 def bootstrap_stability(X, w, k, n_boot=60, seed=0):
-    """How often two paradigms land together across resamples.
+    """
+    Bootstrap Cluster Stability: 
+    This fucntion Resamples the dataset with replacement 60 times. 
+    A score near 1.0 (>0.85) proves the clusters are robust and 
+    not artifacts of a few specific papers.
+    
+    How often two paradigms land together across resamples.
 
     A partition that only exists in this particular sample will score near the rate
     you would get by chance; one that reflects real structure will not.
@@ -648,53 +722,82 @@ def bootstrap_stability(X, w, k, n_boot=60, seed=0):
     # 1 = every pair always agrees, 0.5 = coin flip
     return float(np.mean(np.maximum(v, 1 - v)))
 
-
-def cluster_corpus(df, cfg, k=2, method="kmeans", axes=None, sweep=range(2, 9), 
-                   out=None):
+def cluster_corpus(df, cfg, k=2, method="ward", 
+                   axes=None, sweep=range(2, 9), out=None):
     """Cluster the corpus without looking at the labels, then compare to them."""
     axes = axes or cfg.axes
-    sub = df.dropna(subset=axes).reset_index(drop=True)
-    X = sub[axes].to_numpy(float)
+    
+    # 1. Fill missing values on secondary axes so rows aren't dropped prematurely
+    sub = df.dropna(subset=["x", "y", "z", "t"]).copy()
+    for col in ["s", "x1", "y1", "r"]:
+        if col in axes and col in sub.columns:
+            sub[col] = sub[col].fillna(0.0)
+            
+    sub = sub.dropna(subset=axes).reset_index(drop=True)
+    X_raw = sub[axes].to_numpy(float)
 
-    print("\n=== Clustering axis statistics ===")
+    print("\n=== Clustering axis statistics  (Raw) ===")
     print(sub[axes].describe().T)
     print("\nVariance:")
     print(sub[axes].var())
     print("\nStandard deviation:")
     print(sub[axes].std())
 
+    # 2. Standardize features to unit variance so t does not overpower s, x1, y1
+    std_devs = np.std(X_raw, axis=0)
+    std_devs[std_devs == 0] = 1.0  # prevent division by zero
+    X = (X_raw - np.mean(X_raw, axis=0)) / std_devs
+
+    print("\n=== Clustering axis statistics (Standardized) ===")
+    print(pd.DataFrame(X, columns=axes).describe().T)
+
     w = sub["w"].to_numpy(float)
 
     if method == "ward":
-        lab, Z = ward_labels(X, k)
-        if lab is None:
+        res = ward_labels(X, k)
+        if res is None:
             print("scipy not available, falling back to k-means")
             method = "kmeans"
+        else:
+            lab, Z = res
+            from scipy.cluster.hierarchy import dendrogram
+            fig = plt.figure(figsize=(12, 5))
+            dendrogram(
+                Z,
+                labels=sub["paradigm_id"].values if "paradigm_id" in sub else None,
+                leaf_rotation=90,
+                leaf_font_size=6
+            )
+            plt.title(f"Hierarchical Clustering Dendrogram (Ward's Method, k={k})")
+            plt.xlabel("Paradigm Identifier")
+            plt.ylabel("Ward Linkage Distance")
+            plt.tight_layout()
+            if out:
+                fig.savefig(Path(out) / "fig9_dendrogram.pdf", dpi=300)
+            plt.close(fig)
+
     if method == "kmeans":
         lab, C, _ = weighted_kmeans(X, w, k, seed=0)
     else:
-        from scipy.cluster.hierarchy import dendrogram
         C = np.stack([(w[lab == j, None] * X[lab == j]).sum(0) / w[lab == j].sum()
                       for j in np.unique(lab)])
-        
-        fig = plt.figure(figsize=(14, 7))
-        dendrogram(Z)
-        plt.title(f"Ward hierarchical clustering — {k} clusters")
-        plt.xlabel("Observations")
-        plt.ylabel("Ward linkage distance")
-        plt.tight_layout()
-        #plt.show()
-        save(fig, out, "fig9_dendrogram")
 
-    # order clusters by motor difficulty so the numbering means something
+    # Order clusters by motor difficulty (x)
     order = np.argsort(C[:, axes.index("x")] if "x" in axes else C[:, 0])
     remap = {old: new for new, old in enumerate(order)}
     lab = np.array([remap[v] for v in lab])
     C = C[order]
 
+    # We compute the Adjusted Rand Index (ARI) with Permutation Testing:
+    # Measures whether the discovered geometric clusters match your curated 
+    # classes (motor, salience, bridge, thesis) better than pure chance
+    # GEtting p-value (p_ari) <0.05 proves the alignment between empirical 
+    # geometry and literature categories is statistically significant.
     given = sub["cluster"].to_numpy()
     agree, mapping, M, ua, ub = best_agreement(lab, given)
     ari, p_ari, _ = permutation_p(lab, given)
+
+    
     curve = []
     for kk in sweep:
         if kk >= len(X):
@@ -702,6 +805,7 @@ def cluster_corpus(df, cfg, k=2, method="kmeans", axes=None, sweep=range(2, 9),
         l2, _, inertia = weighted_kmeans(X, w, kk, n_init=12, seed=1)
         curve.append(dict(k=kk, silhouette=silhouette(X, l2), inertia=inertia,
                           stability=bootstrap_stability(X, w, kk, n_boot=30, seed=2)))
+                          
     return dict(sub=sub, X=X, w=w, axes=axes, k=k, method=method, labels=lab,
                 centers=C, given=given, contingency=M, found_names=ua, given_names=ub,
                 agreement=agree, mapping=mapping, ari=ari, p_ari=p_ari,
@@ -1424,9 +1528,9 @@ def fig_clusters(res, ladders, out):
             label="silhouette")
     ax.plot(cur["k"], cur["stability"], "-s", ms=3.2, lw=1.1, color="#7A5EA8",
             label="bootstrap stability")
-    ax.axvline(res["k"], color=CLUSTERS["salience"]["color"], lw=1.0, ls="--", zorder=0)
+    ax.axvline(res["k"], color=CLUSTERS["surprise"]["color"], lw=1.0, ls="--", zorder=0)
     ax.text(res["k"] + 0.1, 0.965, f"k = {res['k']}", fontsize=6.4, ha="left",
-            va="top", color=CLUSTERS["salience"]["color"],
+            va="top", color=CLUSTERS["surprise"]["color"],
             transform=ax.get_xaxis_transform())
     ax.set_xlabel("number of clusters $k$")
     ax.set_ylim(0, 1.05)
@@ -1650,7 +1754,7 @@ def html_payload(df, ladders, cfg, gaps, raw, clus=None):
 
 HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Paradigm space — unexpected events during ongoing action</title>
+<title>Towards a formal literature review — surprising events during ongoing motor control</title>
 <style>
 :root {
   --ink:#101820; --paper:#FFFFFF; --panel:#F4F6F7;
@@ -1756,9 +1860,14 @@ __PLOTLY__
 
 <header>
   <p class="eyebrow">paradigm space · __NPARA__ scored paradigms · __NRECORDS__ records</p>
-  <h1>Experimental paradigm space<br>
-      <em>where an empty region is a claim you can try to break</em></h1>
-  <p class="sub">Every experimental design is a point: how much capacity the task commits,
+  <h1>Towards a formal literature review <br>
+      <em>surprising events during ongoing motor control</em></h1>
+  <p class="sub">We have developed a low-dimensional geometrical representation of the 
+    experimental paradigms used to study the processing and integration of surprising 
+    events during ongoing behaviour. Every experimental paradigm in the reviewed literature
+    is a point in this space. The axes are interpretable variables defining the structure
+    of the paradigm: 
+    : how much capacity the task commits,
      how long the motor command stays open to revision, how deep a hierarchy the
      perturbing event's statistics demand, and how much of the task the event carries.
      One row of the workbook is one paradigm, so a paper running four experiments occupies
@@ -1795,10 +1904,10 @@ __PLOTLY__
   <div id="qlist" class="qlist"></div>
   <div class="plot"><div id="cube" style="height:540px;width:100%"></div></div>
   <div class="two">
-    <div class="card motor"><h3>Motor control / OFC / AIF</h3>
+    <div class="card motor"><h3>Motor control</h3>
       <p>Continuous, task-relevant control: high difficulty, long timescale, and an event
          that redefines the goal. Every perturbation is something the controller must use.</p></div>
-    <div class="card sal"><h3>Surprise / salience</h3>
+    <div class="card sal"><h3>Environmental Surprise</h3>
       <p>Passive or discrete-response stimulation: low difficulty, short timescale, an event
          that carries no task information and is often explicitly to be ignored.</p></div>
   </div>
