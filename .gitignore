@@ -10,11 +10,14 @@ __pycache__/
 *.xlsx
 
 ## Output from the clustering
-figs_ward_3/
-figs_ward_3_stand/
-figs_3_stand_mainAxis/
-figs_ward_3_stand_mainAxis/
-figs_ward_3_stand_mainAxis_noT/
+figs_*/
+# figs_ward_3/
+# figs_ward_3_stand/
+# figs_3_stand_mainAxis/
+# figs_ward_3_stand_mainAxis/
+# figs_ward_3_stand_mainAxis_noT/
+# figs_ward_3_stand_mainAxis_AC/
+# figs_ward_3_stand_mainAxis_noT_AC/
 
 # Distribution / packaging
 .Python

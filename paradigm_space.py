@@ -104,6 +104,19 @@ CLUSTER_OF_FILE = {
 }
 CONF_MARKER = {"hi": "o", "md": "s", "lo": "^"}
 
+# Two display switches, both defaulting off.
+#
+# Confidence is a property of the coding rather than of the paradigm, and letting it
+# drive marker shape made every scatter carry a second variable the reader had to
+# decode before seeing the first. It stays where it belongs: in the row weights, in
+# the audit figure, and in the report.
+#
+# Region names and occupancy counts are stated in the funnel, the report and the
+# prose, so annotating every panel with them repeats one number in five places and
+# crowds the points it is counting.
+MARK_CONFIDENCE = False
+LABEL_REGIONS = False
+
 # candidate regions. Order of the constraints is the order of the funnel.
 REGIONS = {
     "G1": dict(
@@ -117,6 +130,23 @@ REGIONS = {
 }
 
 ACCOUNTS = ["PC", "AIF", "OFC", "SDT", "DDM", "AC", "SAL", "RL"]
+ACCOUNT_LABEL = {
+    "PC": "predictive coding", "AIF": "active inference",
+    "OFC": "optimal feedback control", "SDT": "statistical decision theory",
+    "DDM": "drift diffusion", "AC": "affordance competition",
+    "SAL": "salience detection", "RL": "reinforcement learning",
+}
+# one colour per account, used wherever the account field is drawn categorically.
+# Chosen so the two accounts that own the dense clusters (OFC, SAL) carry the
+# cluster colours of figure 1, and the two the thesis argues for (PC, AIF) are
+# neighbours in hue.
+ACCOUNT_COLOR = {
+    "PC": "#3E6BB0", "AIF": "#6A3D9A", "OFC": "#157F7F", "SDT": "#8C6239",
+    "DDM": "#B0447A", "AC": "#D2892A", "SAL": "#C1425A", "RL": "#6B8E4E",
+}
+# the account field is only meaningful where enough rows support it; below this
+# effective count the cell is drawn as unsupported rather than as a confident zero
+ACCOUNT_MIN_NEFF = 2.0
 ACCOUNT_ALIAS = {
     "salience detection": "SAL", "saliency": "SAL", "salience": "SAL",
     "affordance competition": "AC", "predictive coding": "PC",
@@ -474,16 +504,159 @@ def account_field(df, u, axes=None, sigma=SIGMA, exclude_thesis=True):
     return {a: float(vi) for a, vi in zip(ACCOUNTS, v)}, n_eff
 
 
-def pushforward(df):
+def pushforward(df, mask=None):
     """Which accounts the corpus actually spends its mass on."""
-    Y, keep = account_matrix(df)
-    sub, Y = df[keep], Y[keep]
+    sub = df if mask is None else df[mask]
+    Y, keep = account_matrix(sub)
+    sub, Y = sub[keep], Y[keep]
     if not len(sub):
         return {a: 0.0 for a in ACCOUNTS}
     w = sub["w"].to_numpy(float)
     m = (w[:, None] * Y).sum(0)
     m = m / m.sum() if m.sum() else m
     return {a: float(v) for a, v in zip(ACCOUNTS, m)}
+
+
+# --- the account field over the design space ------------------------------
+#
+# account_field above answers "what would the field call this one design". The
+# functions below answer the prior question the review actually needs: how the
+# accounts are laid out over the space as a whole, so that an empty region can be
+# checked for emptiness in C as well as in H. The estimator is the same
+# Nadaraya-Watson regression, evaluated on a grid rather than at a point, and it is
+# reported with its effective support: a cell whose estimate rests on one row is a
+# statement about that row, not about the field.
+
+def account_rows(df, exclude_thesis=True):
+    """Rows that carry an account, with their normalised distributions."""
+    sub = df if not exclude_thesis else df[~df["thesis"]]
+    Y, keep = account_matrix(sub)
+    return sub[keep], Y[keep]
+
+
+def account_plane(df, a, b, n=61, sigma=SIGMA, exclude_thesis=True):
+    """f(u) on the (a, b) plane, marginalising the remaining axes over the corpus.
+
+    Conditioning the kernel on the two plotted coordinates only is the account-space
+    analogue of the exact density marginal used for the coverage deficit: the value
+    at a cell is the corpus-weighted expectation of the account distribution given
+    those two coordinates, not a slice through a fixed value of the others.
+
+    Returns the grid, F of shape (n, n, |ACCOUNTS|), and the effective number of
+    rows behind every cell.
+    """
+    lin = np.linspace(0, 1, n)
+    sub, Y = account_rows(df.dropna(subset=[a, b]), exclude_thesis)
+    if not len(sub):
+        return lin, np.zeros((n, n, len(ACCOUNTS))), np.zeros((n, n))
+    P = sub[[a, b]].to_numpy(float)
+    w = sub["w"].to_numpy(float)
+    GA, GB = np.meshgrid(lin, lin, indexing="ij")
+    U = np.stack([GA.ravel(), GB.ravel()], axis=1)
+    d2 = ((U[:, None, :] - P[None, :, :]) ** 2).sum(-1)
+    K = w * np.exp(-d2 / (2 * sigma ** 2))
+    s = K.sum(1)
+    ok = s > 1e-12
+    F = np.zeros((len(U), len(ACCOUNTS)))
+    F[ok] = (K[ok] @ Y) / s[ok, None]
+    n_eff = np.zeros(len(U))
+    n_eff[ok] = s[ok] ** 2 / (K[ok] ** 2).sum(1)
+    return lin, F.reshape(n, n, len(ACCOUNTS)), n_eff.reshape(n, n)
+
+
+def account_entropy(F):
+    """Normalised entropy of the account distribution, 0 owned to 1 contested."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        H = -np.nansum(np.where(F > 0, F * np.log(F), 0.0), axis=-1)
+    live = max(int((F.reshape(-1, F.shape[-1]).sum(0) > 0).sum()), 2)
+    return H / np.log(live)
+
+
+def account_dominant(F, floor=0.0):
+    """Index of the leading account and its margin over the runner-up."""
+    order = np.argsort(-F, axis=-1)
+    top = np.take_along_axis(F, order[..., :1], -1)[..., 0]
+    second = np.take_along_axis(F, order[..., 1:2], -1)[..., 0]
+    idx = order[..., 0].astype(float)
+    idx[top <= floor] = np.nan
+    return idx, top - second
+
+
+def account_probes(df, probes, axes=None, sigma=SIGMA):
+    """f and its effective support at a handful of named points of the space.
+
+    This is the table the gap argument turns on: a region that is empty of papers
+    but sits in a well-owned part of account space is a region where filling the
+    gap only re-tests a settled question.
+    """
+    axes = axes or PRINCIPAL
+    out = []
+    for name, u in probes.items():
+        f, n_eff = account_field(df, np.asarray(u, float), axes=axes, sigma=sigma)
+        row = dict(probe=name, n_eff=n_eff,
+                   entropy=float(account_entropy(np.array([[list(f.values())]]))[0, 0]),
+                   **{a: float(v) for a, v in zip(axes, u)}, **f)
+        out.append(row)
+    return pd.DataFrame(out)
+
+
+def account_composition(df, by, axes=None):
+    """Account mass per group: the h layer restricted to a partition of the corpus."""
+    axes = axes or PRINCIPAL
+    sub = df.dropna(subset=axes)
+    groups = pd.Series(by).reindex(sub.index) if not callable(by) else sub.apply(by, axis=1)
+    out = {}
+    for g in pd.unique(groups.dropna()):
+        m = (groups == g).to_numpy()
+        push = pushforward(sub[m])
+        out[g] = dict(n=int(m.sum()), **push)
+    return pd.DataFrame(out).T
+
+
+def account_predictivity(df, axes=None, sigma=SIGMA, n_perm=500, seed=0):
+    """Does the design predict the account, or is f flat?
+
+    Leave-one-out Nadaraya-Watson over the corpus, scored by log loss and by
+    top-1 accuracy against the row's own dominant account, with a null obtained by
+    permuting the account labels across designs. A flat field is the honest
+    alternative hypothesis for every claim made from the account map, so it is
+    tested rather than assumed.
+    """
+    axes = axes or PRINCIPAL
+    sub, Y = account_rows(df.dropna(subset=axes))
+    n = len(sub)
+    if n < 5:
+        return dict(n=n, logloss=float("nan"), accuracy=float("nan"),
+                    logloss_null=float("nan"), accuracy_null=float("nan"),
+                    p=float("nan"))
+    P = sub[axes].to_numpy(float)
+    w = sub["w"].to_numpy(float)
+    d2 = ((P[:, None, :] - P[None, :, :]) ** 2).sum(-1)
+    K = w * np.exp(-d2 / (2 * sigma ** 2))
+    np.fill_diagonal(K, 0.0)                     # leave one out
+    truth = Y.argmax(1)
+
+    def score(Yv):
+        s = K.sum(1)
+        ok = s > 1e-12
+        F = np.zeros_like(Yv)
+        F[ok] = (K[ok] @ Yv) / s[ok, None]
+        p = np.clip(F[np.arange(n), truth], 1e-6, 1.0)
+        return float(-(w * np.log(p)).sum() / w.sum()), \
+            float((w * (F.argmax(1) == truth)).sum() / w.sum())
+
+    ll, acc = score(Y)
+    rng = np.random.default_rng(seed)
+    null_ll, null_acc = [], []
+    for _ in range(n_perm):
+        l, a = score(Y[rng.permutation(n)])
+        null_ll.append(l)
+        null_acc.append(a)
+    null_ll, null_acc = np.array(null_ll), np.array(null_acc)
+    return dict(n=n, logloss=ll, accuracy=acc,
+                logloss_null=float(null_ll.mean()),
+                accuracy_null=float(null_acc.mean()),
+                p=float((null_ll <= ll).sum() + 1) / (n_perm + 1))
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +961,15 @@ def cluster_corpus(df, cfg, k=2, method="ward",
     lab = np.array([remap[v] for v in lab])
     C = C[order]
 
+    # The clustering runs on z-scores so that an axis with a narrow range does not
+    # count for less than one with a wide range. Everything a reader sees, however,
+    # is a rung: a centroid quoted as -0.81 is uninterpretable against a ladder that
+    # runs 0 to 1, and plotting it on a rung axis puts it outside the panel. So the
+    # centroids are carried in both units from here on, standardised for the metrics
+    # and inverse-transformed for every figure, table and sentence.
+    mu = np.mean(X_raw, axis=0)
+    C_raw = C * std_devs + mu
+
     # We compute the Adjusted Rand Index (ARI) with Permutation Testing:
     # Measures whether the discovered geometric clusters match your curated 
     # classes (motor, salience, bridge, thesis) better than pure chance
@@ -806,13 +988,345 @@ def cluster_corpus(df, cfg, k=2, method="ward",
         curve.append(dict(k=kk, silhouette=silhouette(X, l2), inertia=inertia,
                           stability=bootstrap_stability(X, w, kk, n_boot=30, seed=2)))
                           
-    return dict(sub=sub, X=X, w=w, axes=axes, k=k, method=method, labels=lab,
-                centers=C, given=given, contingency=M, found_names=ua, given_names=ub,
+    return dict(sub=sub, X=X, X_raw=X_raw, mu=mu, sd=std_devs, w=w, axes=axes,
+                k=k, method=method, labels=lab,
+                centers=C_raw, centers_z=C,
+                given=given, contingency=M, found_names=ua, given_names=ub,
                 agreement=agree, mapping=mapping, ari=ari, p_ari=p_ari,
                 ami=adjusted_mutual_info(lab, given),
                 silhouette=silhouette(X, lab),
                 stability=bootstrap_stability(X, w, k, n_boot=60, seed=2),
                 curve=pd.DataFrame(curve))
+
+
+# ---------------------------------------------------------------------------
+# 2c. cluster diagnostics
+# ---------------------------------------------------------------------------
+#
+# The claim the chapter rests on is not "a clustering algorithm returns three
+# groups" — it will return three groups from noise — but "the corpus is dense in
+# two places and sparse between them". These functions test that claim and the
+# ones that sit under it, each against an explicit null:
+#
+#   permanova         are the groups separated at all, without assuming normality
+#   permdisp          or do they merely differ in spread, which permanova alone
+#                     cannot distinguish from a difference in location
+#   axis_effects      which axes carry the separation, with an effect size
+#   jaccard_stability which individual clusters survive resampling, not the mean
+#   prediction_strength  how many clusters actually replicate out of sample
+#   separation_profile   is the corpus bimodal along the axis joining two clusters
+#
+# Everything is permutation- or bootstrap-based: with 112 rows on a lattice, the
+# distributional assumptions behind the parametric versions are not met.
+
+def _sq_dists(X):
+    d2 = ((X[:, None, :] - X[None, :, :]) ** 2).sum(-1)
+    np.fill_diagonal(d2, 0.0)
+    return d2
+
+
+def permanova(X, lab, n_perm=999, seed=0):
+    """Anderson's pseudo-F on the Euclidean distance matrix, with a permutation null.
+
+    Preferred to MANOVA here: the coordinates are bounded, discrete and far from
+    multivariate normal, and Wilks' lambda has no defence in that setting. The
+    statistic is the same variance ratio, computed from distances so that no
+    distributional assumption is needed.
+    """
+    d2 = _sq_dists(X)
+    n = len(X)
+    groups = np.unique(lab)
+    a = len(groups)
+    if a < 2 or n <= a:
+        return dict(F=float("nan"), p=float("nan"), R2=float("nan"), n=n, a=a)
+
+    def stat(l):
+        sst = d2.sum() / (2 * n)
+        ssw = 0.0
+        for g in groups:
+            m = l == g
+            ng = int(m.sum())
+            if ng > 1:
+                ssw += d2[np.ix_(m, m)].sum() / (2 * ng)
+        ssa = sst - ssw
+        return (ssa / (a - 1)) / (ssw / (n - a)) if ssw > 0 else np.inf, ssa / sst
+
+    F, R2 = stat(lab)
+    rng = np.random.default_rng(seed)
+    null = np.array([stat(rng.permutation(lab))[0] for _ in range(n_perm)])
+    return dict(F=float(F), p=float((null >= F).sum() + 1) / (n_perm + 1),
+                R2=float(R2), n=n, a=a)
+
+
+def permdisp(X, lab, n_perm=999, seed=0):
+    """Homogeneity of within-group dispersion.
+
+    A significant permanova with a significant permdisp is ambiguous: groups that
+    differ only in how tightly they are packed will produce both. Reported so that
+    the location claim is not read off a spread difference.
+    """
+    groups = np.unique(lab)
+    d = np.zeros(len(X))
+    for g in groups:
+        m = lab == g
+        d[m] = np.linalg.norm(X[m] - X[m].mean(0), axis=1)
+
+    def stat(l):
+        gm = np.array([d[l == g].mean() for g in groups])
+        ns = np.array([(l == g).sum() for g in groups])
+        between = (ns * (gm - d.mean()) ** 2).sum() / max(len(groups) - 1, 1)
+        within = sum(((d[l == g] - d[l == g].mean()) ** 2).sum() for g in groups)
+        within /= max(len(X) - len(groups), 1)
+        return between / within if within > 0 else np.inf
+
+    F = stat(lab)
+    rng = np.random.default_rng(seed)
+    null = np.array([stat(rng.permutation(lab)) for _ in range(n_perm)])
+    return dict(F=float(F), p=float((null >= F).sum() + 1) / (n_perm + 1),
+                spread={str(g): float(d[lab == g].mean()) for g in groups})
+
+
+def axis_effects(X, lab, axes, n_perm=999, seed=0):
+    """Which axes carry the separation, as eta squared with a permutation p.
+
+    A partition that differs on task difficulty but not on task relevance is telling
+    you the corpus is organised by engagement rather than by what the event means —
+    which is a different claim from "the clusters are real", and needs its own test.
+    """
+    rng = np.random.default_rng(seed)
+    out = []
+    groups = np.unique(lab)
+    for j, a in enumerate(axes):
+        v = X[:, j]
+        sst = ((v - v.mean()) ** 2).sum()
+
+        def eta(l):
+            if sst <= 0:
+                return 0.0
+            ssb = sum((l == g).sum() * (v[l == g].mean() - v.mean()) ** 2
+                      for g in groups)
+            return ssb / sst
+
+        e = eta(lab)
+        null = np.array([eta(rng.permutation(lab)) for _ in range(n_perm)])
+        out.append(dict(axis=a, eta2=float(e),
+                        p=float((null >= e).sum() + 1) / (n_perm + 1),
+                        eta2_null=float(null.mean())))
+    return pd.DataFrame(out)
+
+
+def hedges_g(a, b):
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return float("nan")
+    sp = np.sqrt(((na - 1) * a.var(ddof=1) + (nb - 1) * b.var(ddof=1)) / (na + nb - 2))
+    if sp == 0:
+        return 0.0
+    d = (a.mean() - b.mean()) / sp
+    return float(d * (1 - 3 / (4 * (na + nb) - 9)))       # small-sample correction
+
+
+def pairwise_axis_table(X, lab, axes):
+    """Hedges' g on every axis for every pair of clusters."""
+    rows = []
+    groups = np.unique(lab)
+    for i, g1 in enumerate(groups):
+        for g2 in groups[i + 1:]:
+            r = dict(pair=f"c{g1} vs c{g2}")
+            for j, a in enumerate(axes):
+                r[a] = hedges_g(X[lab == g1, j], X[lab == g2, j])
+            r["centroid_distance"] = float(
+                np.linalg.norm(X[lab == g1].mean(0) - X[lab == g2].mean(0)))
+            rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def jaccard_stability(X, w, lab, k, n_boot=100, seed=0):
+    """Hennig's cluster-wise bootstrap: how often each cluster survives resampling.
+
+    The single mean co-assignment number already reported is dominated by whichever
+    cluster is largest, so a small cluster can dissolve completely without moving it.
+    Reported per cluster, on the usual reading: below 0.6 dissolved, above 0.75 stable.
+    """
+    rng = np.random.default_rng(seed)
+    groups = np.unique(lab)
+    best = {int(g): [] for g in groups}
+    for b in range(n_boot):
+        idx = rng.choice(len(X), len(X), replace=True)
+        uniq = np.unique(idx)
+        if len(uniq) <= k:
+            continue
+        lb, _, _ = weighted_kmeans(X[uniq], w[uniq], k, n_init=6, seed=int(seed + b))
+        member = {int(g): set(uniq[lb == g]) for g in np.unique(lb)}
+        for g in groups:
+            orig = set(np.flatnonzero(lab == g)) & set(uniq)
+            if not orig:
+                continue
+            best[int(g)].append(max(
+                (len(orig & m) / len(orig | m) for m in member.values() if m),
+                default=0.0))
+    return {g: float(np.mean(v)) if v else float("nan") for g, v in best.items()}
+
+
+def prediction_strength(X, w, ks, n_split=20, seed=0):
+    """Tibshirani and Walther: how many clusters replicate on held-out data.
+
+    The silhouette rises with k on a lattice, so it cannot choose k here; prediction
+    strength can, and comes with a conventional cutoff at 0.8. For each split, the
+    training centroids are used to predict the test partition, and the score is the
+    worst cluster's rate of preserved co-membership.
+    """
+    rng = np.random.default_rng(seed)
+    out = []
+    for k in ks:
+        scores = []
+        for _ in range(n_split):
+            perm = rng.permutation(len(X))
+            a, b = perm[:len(X) // 2], perm[len(X) // 2:]
+            if min(len(a), len(b)) <= k:
+                continue
+            la, Ca, _ = weighted_kmeans(X[a], w[a], k, n_init=6, seed=int(rng.integers(1e6)))
+            lb, _, _ = weighted_kmeans(X[b], w[b], k, n_init=6, seed=int(rng.integers(1e6)))
+            pred = ((X[b][:, None, :] - Ca[None, :, :]) ** 2).sum(-1).argmin(1)
+            worst = 1.0
+            for g in np.unique(lb):
+                m = np.flatnonzero(lb == g)
+                if len(m) < 2:
+                    continue
+                same = pred[m][:, None] == pred[m][None, :]
+                np.fill_diagonal(same, False)
+                worst = min(worst, same.sum() / (len(m) * (len(m) - 1)))
+            scores.append(worst)
+        out.append(dict(k=k, prediction_strength=float(np.mean(scores)) if scores else np.nan))
+    return pd.DataFrame(out)
+
+
+def _gaussian_mixture_1d(v, k, iters=300, seed=0):
+    """Tiny EM, enough for the one- versus two-component comparison below."""
+    rng = np.random.default_rng(seed)
+    if k == 1:
+        mu, sd = np.array([v.mean()]), np.array([max(v.std(), 1e-6)])
+        pi = np.array([1.0])
+    else:
+        q = np.quantile(v, [0.25, 0.75])
+        mu = q + rng.normal(0, 1e-3, k)
+        sd = np.full(k, max(v.std(), 1e-6))
+        pi = np.full(k, 1.0 / k)
+    for _ in range(iters):
+        p = pi * np.exp(-0.5 * ((v[:, None] - mu) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
+        tot = p.sum(1, keepdims=True)
+        r = p / np.maximum(tot, 1e-300)
+        nk = r.sum(0)
+        if (nk < 1e-6).any():
+            break
+        pi = nk / len(v)
+        mu = (r * v[:, None]).sum(0) / nk
+        sd = np.sqrt(np.maximum((r * (v[:, None] - mu) ** 2).sum(0) / nk, 1e-8))
+    ll = float(np.log(np.maximum(
+        (pi * np.exp(-0.5 * ((v[:, None] - mu) / sd) ** 2)
+         / (sd * np.sqrt(2 * np.pi))).sum(1), 1e-300)).sum())
+    npar = 3 * len(mu) - 1
+    return dict(mu=mu, sd=sd, pi=pi, loglik=ll,
+                bic=float(npar * np.log(len(v)) - 2 * ll))
+
+
+def _valley(X, w, seed=0):
+    """Split into two, project onto the line joining the halves, measure the valley.
+
+    Factored out because the null below has to be put through exactly this, and not
+    through some simpler version of it.
+    """
+    lab, C, _ = weighted_kmeans(X, w, 2, n_init=12, seed=seed)
+    d = C[0] - C[1]
+    nrm = np.linalg.norm(d)
+    if nrm == 0:
+        return dict(gap=0.0, delta_bic=0.0, separation=0.0, proj=np.zeros(len(X)),
+                    labels=lab, direction=d)
+    u = d / nrm
+    v = X @ u
+    order = np.sort(v)
+    lo, hi = np.quantile(order, [0.10, 0.90])
+    inner = order[(order >= lo) & (order <= hi)]
+    gap = float(np.diff(inner).max() / max(order.std(), 1e-9)) if len(inner) > 2 else 0.0
+    one = _gaussian_mixture_1d(order, 1)
+    two = _gaussian_mixture_1d(order, 2, seed=seed)
+    sep = (abs(two["mu"][0] - two["mu"][1]) / np.sqrt((two["sd"] ** 2).mean())
+           if len(two["mu"]) == 2 else 0.0)
+    return dict(gap=gap, delta_bic=float(one["bic"] - two["bic"]),
+                separation=float(sep), proj=v, labels=lab, direction=u,
+                mixture=two)
+
+
+def separation_profile(X, w, n_null=199, seed=0):
+    """Is the corpus bimodal, tested against a null that gets the same treatment?
+
+    The obvious version of this test is circular and worth spelling out, because it
+    looks convincing: choose the direction that best separates two clusters, project
+    onto it, then ask whether the projection is bimodal. It always is — the direction
+    was selected to make it so, and a single Gaussian cloud put through the same steps
+    produces a clean-looking valley and a decisive BIC. Testing the projection against
+    a Gaussian fitted to that same projection does not repair this, since the
+    selection happened before the fit.
+
+    So the null here is not a distribution over projections but over corpora: draw a
+    unimodal reference with the covariance of the real corpus, split it in two, pick
+    its own best direction, and measure its own valley. The p-values ask whether the
+    real corpus has a deeper valley than a shapeless cloud of the same shape and size
+    does once both have been through the identical procedure. This is the gap
+    statistic's logic applied to bimodality rather than to inertia.
+    """
+    obs = _valley(X, w, seed=seed)
+    rng = np.random.default_rng(seed)
+    mu, cov = X.mean(0), np.cov(X, rowvar=False)
+    try:
+        L = np.linalg.cholesky(cov + 1e-9 * np.eye(X.shape[1]))
+    except np.linalg.LinAlgError:
+        L = np.diag(np.sqrt(np.maximum(np.diag(cov), 1e-9)))
+    ng, nb = [], []
+    for b in range(n_null):
+        Z = mu + rng.standard_normal(X.shape) @ L.T
+        r = _valley(Z, w, seed=int(seed + b + 1))
+        ng.append(r["gap"])
+        nb.append(r["delta_bic"])
+    ng, nb = np.array(ng), np.array(nb)
+    v = np.sort(obs["proj"])
+    ties = 1.0 - len(np.unique(np.round(v, 6))) / len(v)
+    return dict(
+        gap=obs["gap"], delta_bic=obs["delta_bic"], separation=obs["separation"],
+        proj=obs["proj"], labels=obs["labels"], direction=obs["direction"],
+        p_gap=float((ng >= obs["gap"]).sum() + 1) / (n_null + 1),
+        p_bic=float((nb >= obs["delta_bic"]).sum() + 1) / (n_null + 1),
+        null_gap=ng, null_bic=nb,
+        gap_null_mean=float(ng.mean()), bic_null_mean=float(nb.mean()),
+        tied_fraction=float(ties), n_null=n_null)
+
+
+def cluster_diagnostics(clus, n_perm=999, seed=0, boot=100):
+    """Every test above, run on the partition the corpus produced."""
+    X, lab, w, axes = clus["X"], clus["labels"], clus["w"], clus["axes"]
+    k = clus["k"]
+    out = dict(
+        permanova=permanova(X, lab, n_perm=n_perm, seed=seed),
+        permdisp=permdisp(X, lab, n_perm=n_perm, seed=seed),
+        axis=axis_effects(X, lab, axes, n_perm=n_perm, seed=seed),
+        pairwise=pairwise_axis_table(X, lab, axes),
+        jaccard=jaccard_stability(X, w, lab, k, n_boot=boot, seed=seed),
+        strength=prediction_strength(X, w, list(clus["curve"]["k"]), seed=seed),
+    )
+    # The valley test does not take the k of this run, nor its labels: it splits the
+    # corpus in two itself, because "two literatures with a sparse region between
+    # them" is a claim about a binary split of the whole corpus, and because a null
+    # can only be put through a procedure that does not consult the answer.
+    sep = separation_profile(X, w, n_null=max(n_perm // 5, 99), seed=seed)
+    given = clus.get("given")
+    if given is not None:
+        sep["composition"] = {
+            f"h{j}": {str(g): int(((sep["labels"] == j) & (given == g)).sum())
+                      for g in np.unique(given)}
+            for j in (0, 1)}
+    out["separation"] = sep
+    out["pair"] = None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -956,9 +1470,14 @@ def panel_title(ax, text, sub=None, width=30, fontsize=7.2, pad=4.0, tail=None):
         else:
             lines.append(tail)
     if sub:
-        ax.text(0, 1.008, sub, transform=ax.transAxes, fontsize=fontsize - 1.1,
-                color="#6C7C85", va="bottom", ha="left")
-        pad = pad + fontsize + 1.5
+        # the subtitle carries the statistics, which are longer than the title; left
+        # unwrapped it runs across the panel next door exactly as an unwrapped title
+        # would, so it wraps at the same width and the pad grows by its line count
+        slines = textwrap.wrap(sub, width=int(width * 1.25)) or [sub]
+        ax.text(0, 1.008, "\n".join(slines), transform=ax.transAxes,
+                fontsize=fontsize - 1.1, color="#6C7C85", va="bottom", ha="left",
+                linespacing=1.25)
+        pad = pad + len(slines) * (fontsize + 1.5)
     ax.set_title("\n".join(lines), loc="left", fontsize=fontsize, pad=pad,
                  linespacing=1.20)
 
@@ -990,16 +1509,22 @@ def spread(a, b, radius=0.013):
 
 
 def scatter_corpus(ax, df, a, b, live=None, size=17, zorder=3, jitter=True):
-    """Cluster colour, confidence marker; rows failing `live` are drawn as context."""
+    """Cluster colour; rows failing `live` are drawn as context.
+
+    Marker shape follows confidence only when MARK_CONFIDENCE is on. With it off
+    every row is a filled circle and the panel carries one variable, not two.
+    """
     if jitter:
         xa, xb = spread(df[a].to_numpy(float), df[b].to_numpy(float))
     else:
         xa, xb = df[a].to_numpy(float), df[b].to_numpy(float)
     live = np.ones(len(df), bool) if live is None else np.asarray(live, bool)
-    for conf, marker in CONF_MARKER.items():
+    groups = (CONF_MARKER.items() if MARK_CONFIDENCE else [(None, "o")])
+    for conf, marker in groups:
         for cl, style in CLUSTERS.items():
-            m = (df["confidence"].to_numpy() == conf) & \
-                (df["cluster"].to_numpy() == cl)
+            m = (df["cluster"].to_numpy() == cl)
+            if conf is not None:
+                m = m & (df["confidence"].to_numpy() == conf)
             if not m.any():
                 continue
             on = m & live
@@ -1014,13 +1539,42 @@ def scatter_corpus(ax, df, a, b, live=None, size=17, zorder=3, jitter=True):
                            linewidths=0.4, alpha=0.92, zorder=zorder)
 
 
-def corpus_legend(fig, ncol=4, y=-0.02, context=False, confidence=True):
+def scatter_overlay(ax, over, a, b, size=34, zorder=6, jitter=True):
+    """Draw the held-out thesis paradigms on top of an estimate they took no part in.
+
+    Deliberately a different marker rather than a different colour: these rows were
+    excluded from the density, the regions and the clustering, so they are evidence
+    about the map rather than part of it, and the panel should not let them be
+    mistaken for corpus.
+    """
+    if over is None or not len(over):
+        return
+    sub = over.dropna(subset=[a, b])
+    if not len(sub):
+        return
+    if jitter:
+        xa, xb = spread(sub[a].to_numpy(float), sub[b].to_numpy(float))
+    else:
+        xa, xb = sub[a].to_numpy(float), sub[b].to_numpy(float)
+    ax.scatter(xa, xb, s=size, marker="*", color=CLUSTERS["thesis"]["color"],
+               edgecolors="white", linewidths=0.5, alpha=0.95, zorder=zorder)
+
+
+def corpus_legend(fig, ncol=4, y=-0.02, context=False, confidence=None,
+                  overlay=False):
     handles = [Line2D([], [], marker="o", ls="", color=s["color"],
                       markeredgecolor="white", markersize=5, label=s["label"])
-               for s in CLUSTERS.values()]
+               for k, s in CLUSTERS.items() if not (overlay and k == "thesis")]
+    if confidence is None:
+        confidence = MARK_CONFIDENCE
     if confidence:   # 3D scatter draws one marker per call, so shape carries nothing there
         handles += [Line2D([], [], marker=m, ls="", color=INK, markersize=4.4,
                            label=f"confidence {c}") for c, m in CONF_MARKER.items()]
+    if overlay:
+        handles.append(Line2D([], [], marker="*", ls="",
+                              color=CLUSTERS["thesis"]["color"],
+                              markeredgecolor="white", markersize=8,
+                              label="thesis paradigms (held out of every estimate)"))
     if context:
         handles.append(Line2D([], [], marker="o", ls="", markerfacecolor="none",
                               markeredgecolor=GREY, markersize=4.4,
@@ -1031,37 +1585,51 @@ def corpus_legend(fig, ncol=4, y=-0.02, context=False, confidence=True):
 
 # --- figure 1: the corpus in projection -----------------------------------
 
-def fig_projections(df, ladders, out):
+def fig_projections(df, ladders, out, overlay=None, cfg=None):
     """Six planes, six identical square panels, no region boxes.
 
     The old version of this figure drew the candidate regions here, which is
     what made it read as emptier than the data: a box in the (x, y) plane is a
     slab in the space, and points that a third constraint excludes still fall
     inside its shadow. Region membership now has a figure of its own.
+
+    Each panel carries the exact marginal density beneath its scatter, on one shared
+    scale, so that the eye reads where the corpus concentrates rather than trying to
+    judge it from overplotted markers on a lattice.
     """
     planes = [("x", "y"), ("x", "z"), ("x", "t"),
               ("y", "z"), ("y", "t"), ("z", "t")]
     sub = df.dropna(subset=PRINCIPAL)
+    sigma = getattr(cfg, "sigma", SIGMA) if cfg is not None else SIGMA
+    P, w = sub[PRINCIPAL].to_numpy(float), sub["w"].to_numpy(float)
+    lin = np.linspace(0, 1, 70)
+    shade = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "wall", ["#FFFFFF", "#DCE4E9", "#8FA5B1"])
     fig, axes = plt.subplots(2, 3, figsize=(3 * PANEL_W + 1.1, 2 * PANEL_W + 1.0))
     for ax, (a, b) in zip(axes.ravel(), planes):
         rungs = ([v for v, *_ in ladders.get(a, {}).get("rungs", [])],
                  [v for v, *_ in ladders.get(b, {}).get("rungs", [])])
+        d = density(P, w, (PRINCIPAL.index(a), PRINCIPAL.index(b)), (lin, lin), sigma)
+        ax.contourf(lin, lin, (d / d.max()).T, levels=np.linspace(0.05, 1, 10),
+                    cmap=shade, alpha=0.75, zorder=0)
         square(ax, label_of(a, ladders), label_of(b, ladders), rungs)
         scatter_corpus(ax, sub, a, b)
+        scatter_overlay(ax, overlay, a, b)
         r = np.corrcoef(sub[a], sub[b])[0, 1]
         ax.text(0.035, 0.965, f"$r$ = {r:+.2f}", transform=ax.transAxes,
                 ha="left", va="top", fontsize=6.4, color="#54646D",
                 bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.0))
-    fig.suptitle(f"the corpus in the six principal planes  ·  n = {len(sub)} paradigms",
-                 fontsize=8, y=1.005, color="#54646D")
-    corpus_legend(fig, ncol=4, y=-0.035)
+    fig.suptitle(f"the corpus in the six principal planes  ·  n = {len(sub)} paradigms"
+                 "  ·  shading is the marginal density",
+                 fontsize=8, y=0.995, color="#54646D")
+    corpus_legend(fig, ncol=4, y=-0.035, overlay=overlay is not None and len(overlay) > 0)
     save(fig, out, "fig1_projections")
     return len(sub)
 
 
 # --- figure 2: the candidate regions, tested ------------------------------
 
-def fig_regions(df, ladders, out):
+def fig_regions(df, ladders, out, overlay=None):
     """One row per region: two conditional planes and the constraint funnel.
 
     A panel shows only the paradigms that satisfy the constraints on the axes
@@ -1095,9 +1663,11 @@ def fig_regions(df, ladders, out):
                                    edgecolor=spec["color"], lw=0.9,
                                    ls="--" if empty else "-", zorder=1))
             scatter_corpus(ax, sub, a, b, live=live)
-            ax.text((xlo + xhi) / 2, yhi - 0.055, f"{inside}",
-                    ha="center", va="top", fontsize=9, color=spec["color"],
-                    fontweight="bold", zorder=6)
+            scatter_overlay(ax, overlay, a, b)
+            if LABEL_REGIONS:
+                ax.text((xlo + xhi) / 2, yhi - 0.055, f"{inside}",
+                        ha="center", va="top", fontsize=9, color=spec["color"],
+                        fontweight="bold", zorder=6)
             cond = ", ".join(f"${ax_}$ {'≥' if op == '>=' else '≤'} {v:g}"
                              for ax_, op, v in off)
             ax.set_title(f"among designs with {cond}" if off
@@ -1119,11 +1689,15 @@ def fig_regions(df, ladders, out):
         ax.set_yticklabels(labels, fontsize=6.6)
         ax.set_xlim(0, max(vals) * 1.18)
         ax.set_xlabel("paradigms surviving")
-        ax.set_title("\n".join(textwrap.wrap(f"{name}  ·  {spec['title']}", 44)),
+        # the funnel already counts the region row by row, so the title names what
+        # the region is rather than repeating its label and its occupancy
+        head = f"{name}  ·  {spec['title']}" if LABEL_REGIONS else spec["title"]
+        ax.set_title("\n".join(textwrap.wrap(head, 44)),
                      fontsize=7.2, color=spec["color"], loc="left", pad=4)
         ax.spines["left"].set_visible(False)
         ax.tick_params(axis="y", length=0)
-    corpus_legend(fig, ncol=4, y=-0.06, context=True)
+    corpus_legend(fig, ncol=4, y=-0.06, context=True,
+                  overlay=overlay is not None and len(overlay) > 0)
     save(fig, out, "fig2_regions")
     return counts
 
@@ -1141,16 +1715,24 @@ def _box3d(ax, bounds, color, alpha=0.10):
                                          zsort="min"))
 
 
-def fig_cube(df, ladders, out):
+def fig_cube(df, ladders, out, overlay=None, cfg=None):
     """Two 3D views, each carrying every constraint of the region it shows.
 
     Choosing the triple this way is the whole point: in (x, y, t) the G1 box is
     the region, not its shadow, so a marker inside the box is a paradigm inside
     the region and the picture cannot mislead.
+
+    Drawn in the same idiom as figure 0: the walls carry the marginal density of the
+    pair they span, so each view shows both where the corpus is in three dimensions
+    and what its projections look like, and the region box stays quiet enough to read
+    the points through it.
     """
     sub = df.dropna(subset=PRINCIPAL)
-    views = [("G1", ("x", "y", "t"), 22, -58), ("G2", ("x", "z", "t"), 22, -58)]
-    fig = plt.figure(figsize=(7.0, 3.5))
+    sigma = getattr(cfg, "sigma", SIGMA) if cfg is not None else SIGMA
+    views = [("G1", ("x", "y", "t"), 19, -56), ("G2", ("x", "z", "t"), 19, -56)]
+    shade = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "wall", ["#FFFFFF", "#D6DEE3", "#93A6B0"])
+    fig = plt.figure(figsize=(7.4, 3.8))
     for i, (name, (a, b, c), elev, azim) in enumerate(views):
         ax = fig.add_subplot(1, 2, i + 1, projection="3d")
         spec = REGIONS[name]
@@ -1161,20 +1743,41 @@ def fig_cube(df, ladders, out):
                 lo[k] = v
             else:
                 hi[k] = v
-        _box3d(ax, [(lo[a], hi[a]), (lo[b], hi[b]), (lo[c], hi[c])], spec["color"])
+
+        P = sub[[a, b, c]].to_numpy(float)
+        w = sub["w"].to_numpy(float)
+        lin = np.linspace(0, 1, 60)
+        for idx, zdir, offset in (((0, 1), "z", 0.0), ((0, 2), "y", 1.0),
+                                  ((1, 2), "x", 0.0)):
+            d = density(P, w, idx, (lin, lin), sigma)
+            d = d / d.max()
+            G1_, G2_ = np.meshgrid(lin, lin, indexing="ij")
+            args = {"z": (G1_, G2_, d), "y": (G1_, d, G2_), "x": (d, G1_, G2_)}[zdir]
+            ax.contourf(*args, zdir=zdir, offset=offset,
+                        levels=np.linspace(0.04, 1, 9), cmap=shade, alpha=0.55,
+                        zorder=0, antialiased=True)
+
+        _box3d(ax, [(lo[a], hi[a]), (lo[b], hi[b]), (lo[c], hi[c])], spec["color"], 0.09)
         inside = satisfies(sub, spec["constraints"]).to_numpy()
         pa, pb = spread(sub[a].to_numpy(float), sub[b].to_numpy(float))
         pc = sub[c].to_numpy(float)
         colors = np.array([CLUSTERS[c_]["color"] for c_ in sub["cluster"]])
-        # shadow on the floor: three dimensions on a flat page need a depth cue
-        ax.scatter(pa, pb, np.zeros_like(pc), s=5, color=GREY, alpha=0.35,
-                   depthshade=False, zorder=1)
         ax.scatter(pa[~inside], pb[~inside], pc[~inside], s=15,
                    c=colors[~inside], edgecolors="white", linewidths=0.3,
-                   alpha=0.9, depthshade=False)
+                   alpha=0.92, depthshade=True, zorder=4)
         if inside.any():
-            ax.scatter(pa[inside], pb[inside], pc[inside], s=42, c=colors[inside],
-                       edgecolors=INK, linewidths=0.9, depthshade=False)
+            # occupants are marked by a dark ring rather than by size: a region is
+            # being argued to be nearly empty, and inflating the few points in it
+            # works against the reader seeing that
+            ax.scatter(pa[inside], pb[inside], pc[inside], s=20, c=colors[inside],
+                       edgecolors=INK, linewidths=0.8, depthshade=True, zorder=6)
+        if overlay is not None and len(overlay):
+            ov = overlay.dropna(subset=[a, b, c])
+            if len(ov):
+                oa, ob = spread(ov[a].to_numpy(float), ov[b].to_numpy(float))
+                ax.scatter(oa, ob, ov[c].to_numpy(float), s=42, marker="*",
+                           color=CLUSTERS["thesis"]["color"], edgecolors="white",
+                           linewidths=0.5, depthshade=False, zorder=7)
         for k, ax_name in zip((a, b, c), ("x", "y", "z")):
             getattr(ax, f"set_{ax_name}lim")(0, 1)
             getattr(ax, f"set_{ax_name}ticks")([0, 0.5, 1])
@@ -1185,13 +1788,17 @@ def fig_cube(df, ladders, out):
         ax.tick_params(pad=0.6, labelsize=6.0)
         ax.set_box_aspect((1, 1, 1))
         ax.view_init(elev=elev, azim=azim)
-        ax.set_title(f"{'AB'[i]}  ({a}, {b}, {c}) — {name}: "
-                     f"{int(inside.sum())} of {len(sub)} inside",
-                     fontsize=7.4, loc="left", pad=-4)
+        head = (f"{'AB'[i]}  ({a}, {b}, {c}) — {name}: {int(inside.sum())} of "
+                f"{len(sub)} inside" if LABEL_REGIONS else
+                f"{'AB'[i]}  ({a}, {b}, {c})")
+        ax.set_title(head, fontsize=7.4, loc="left", pad=-2)
         for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
             pane.set_facecolor("white")
             pane.set_edgecolor(RULE)
-    corpus_legend(fig, ncol=4, y=0.02, confidence=False)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis._axinfo["grid"].update(color="#E7EBED", linewidth=0.5)
+    corpus_legend(fig, ncol=4, y=0.015, confidence=False,
+                  overlay=overlay is not None and len(overlay) > 0)
     save(fig, out, "fig3_cube")
 
 
@@ -1202,20 +1809,23 @@ def _arrow3(ax, start, end, color=INK, lw=1.1):
     ax.scatter(*[[e] for e in end], s=12, color=color, marker="o", depthshade=False)
 
 
-def fig_space(df, ladders, out, axes=("x", "y", "t")):
+def fig_space(df, ladders, out, axes=("x", "y", "t"), cfg=None, overlay=None):
     """What the coordinates mean, and where the corpus sits in them.
 
     A gives each ladder its own column so the rung labels cannot collide, with the
     occupancy of every rung drawn as a bar to the left of the spine: the reader sees
-    the definition and the coverage of an axis in one object. B places the corpus in
-    three dimensions, with all three marginals cast onto the back walls, so the shape
-    of each projection is visible without hunting for it in another figure.
+    the definition and the coverage of an axis in one object. Rung labels wrap rather
+    than truncate — a rung called "continuous control, non-…" is not a definition of
+    anything, and the whole point of the panel is that the reader can check the coding
+    against the axis. B places the corpus in three dimensions, with the marginal
+    density of each pair cast onto the corresponding wall, so the shape of every
+    projection is visible without hunting for it in another figure.
     """
     a, b, c = axes
     sub = df.dropna(subset=PRINCIPAL)
-    fig = plt.figure(figsize=(7.4, 4.1))
-    gs = fig.add_gridspec(1, 4, width_ratios=[1, 1, 1, 3.05], wspace=0.06,
-                          left=0.035, right=0.985, bottom=0.10, top=0.90)
+    fig = plt.figure(figsize=(7.6, 4.3))
+    gs = fig.add_gridspec(1, 4, width_ratios=[1.16, 1.16, 1.16, 2.72], wspace=0.05,
+                          left=0.030, right=0.988, bottom=0.11, top=0.88)
 
     # ---- A: the ladders, one column each
     for i, k in enumerate((a, b, c)):
@@ -1230,44 +1840,75 @@ def fig_space(df, ladders, out, axes=("x", "y", "t")):
                 if kk != k:
                     continue
                 lo, hi = (v, 1.02) if op == ">=" else (-0.02, v)
-                ax.add_patch(Rectangle((-0.055, lo), 0.11, hi - lo, facecolor=spec["color"],
-                                       alpha=0.15, lw=0, zorder=0))
-                ax.text(-0.075, (lo + hi) / 2, slab, fontsize=5.6, rotation=90,
-                        ha="center", va="center", color=spec["color"])
+                # the region bands are context, not content: narrow and pale, so the
+                # ladder they annotate stays the thing the eye lands on
+                ax.add_patch(Rectangle((-0.042, lo), 0.084, hi - lo,
+                                       facecolor=spec["color"], alpha=0.10, lw=0,
+                                       zorder=0))
+                ax.text(-0.062, (lo + hi) / 2, slab, fontsize=4.8, rotation=90,
+                        ha="center", va="center", color=spec["color"], alpha=0.85)
+        # how much vertical room a label has before it reaches the rung below
+        spacing = (min(np.diff(sorted(v for v, *_ in rungs))) if len(rungs) > 1
+                   else 0.20)
         for (v, lab, _), n in zip(rungs, counts):
             if n:                                   # occupancy bar, drawn inward
-                ax.add_patch(Rectangle((0, v - 0.019), 0.26 * n / top, 0.038,
+                ax.add_patch(Rectangle((0, v - 0.019), 0.24 * n / top, 0.038,
                                        facecolor=CLUSTERS["thesis"]["color"], alpha=0.28,
                                        lw=0, zorder=2))
             ax.plot([-0.035, 0.035], [v, v], color=INK, lw=0.85, zorder=3,
                     solid_capstyle="butt")
             txt = re.sub(r"\s*/.*$", "", str(lab)).strip()
-            txt = textwrap.shorten(txt, width=25, placeholder="…")
-            ax.text(0.33, v + 0.016, f"{v:g}", fontsize=5.4, va="bottom", color=INK)
-            ax.text(0.33, v - 0.016, txt, fontsize=5.2, va="top", color="#6C7C85")
+            lines = textwrap.wrap(txt, width=21, break_long_words=False) or [txt]
+            # never let a label reach the next rung: two lines fit at the tightest
+            # spacing any of these ladders uses, three do not
+            room = max(int((spacing - 0.045) / 0.031), 1)
+            if len(lines) > room:
+                lines = lines[:room]
+                lines[-1] = textwrap.shorten(" ".join(
+                    textwrap.wrap(txt, width=21)[room - 1:]), width=20,
+                    placeholder="…")
+            ax.text(0.31, v + 0.014, f"{v:g}", fontsize=5.4, va="bottom", color=INK)
+            ax.text(0.31, v - 0.014, "\n".join(lines), fontsize=5.1, va="top",
+                    color="#6C7C85", linespacing=1.22)
             if n:
-                ax.text(0.26 * n / top + 0.025, v, str(n), fontsize=4.8, va="center",
+                ax.text(0.24 * n / top + 0.022, v, str(n), fontsize=4.8, va="center",
                         ha="left", color=CLUSTERS["thesis"]["color"])
-        ax.set_xlim(-0.15, 1.60)
+        ax.set_xlim(-0.13, 1.52)
         ax.set_ylim(-0.075, 1.10)
         ax.axis("off")
         name = re.sub(r"\s*\(.*?\)\s*$", "", ladders.get(k, {}).get("name", "")).strip()
-        ax.text(0, 1.13, label_of(k, short=True), fontsize=10, ha="center", color=INK)
-        ax.text(0.28, 1.135, textwrap.shorten(name or FALLBACK_LABEL[k], 27, placeholder="…"),
-                fontsize=5.6, ha="left", va="center", color="#6C7C85")
+        ax.text(0, 1.155, label_of(k, short=True), fontsize=10, ha="center", color=INK)
+        ax.text(0.26, 1.16, "\n".join(textwrap.wrap(
+            name or FALLBACK_LABEL[k], width=22, break_long_words=False)[:2]),
+            fontsize=5.5, ha="left", va="center", color="#6C7C85", linespacing=1.2)
         if i == 0:
-            ax.text(-0.15, 1.215, "A   the rung ladders, and how many paradigms sit on "
+            ax.text(-0.13, 1.245, "A   the rung ladders, and how many paradigms sit on "
                     "each rung", fontsize=7.6, ha="left", color=INK)
 
     # ---- B: the corpus in three dimensions, with its marginals on the walls
     ax3 = fig.add_subplot(gs[0, 3], projection="3d")
     pa, pb = spread(sub[a].to_numpy(float), sub[b].to_numpy(float))
     pc = sub[c].to_numpy(float)
-    colors = np.array([CLUSTERS[cl]["color"] for cl in sub["cluster"]])
-    wall = dict(s=7, color=GREY, alpha=0.35, depthshade=False, zorder=1)
-    ax3.scatter(pa, pb, np.zeros_like(pc), **wall)          # floor: (x, y)
-    ax3.scatter(pa, np.ones_like(pb), pc, **wall)           # back wall: (x, t)
-    ax3.scatter(np.zeros_like(pa), pb, pc, **wall)          # side wall: (y, t)
+
+    # each wall carries the exact marginal density of the pair it spans, rather than a
+    # second copy of the scatter: with a hundred points on a lattice the shadow
+    # scatters were mostly overplot, and the density is what the reader wants from a
+    # projection anyway
+    sigma = getattr(cfg, "sigma", SIGMA) if cfg is not None else SIGMA
+    P = sub[[a, b, c]].to_numpy(float)
+    w = sub["w"].to_numpy(float)
+    lin = np.linspace(0, 1, 60)
+    shade = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "wall", ["#FFFFFF", "#D6DEE3", "#93A6B0"])
+    for idx, zdir, offset in (((0, 1), "z", 0.0), ((0, 2), "y", 1.0),
+                              ((1, 2), "x", 0.0)):
+        d = density(P, w, idx, (lin, lin), sigma)
+        d = d / d.max()
+        G1_, G2_ = np.meshgrid(lin, lin, indexing="ij")
+        args = {"z": (G1_, G2_, d), "y": (G1_, d, G2_), "x": (d, G1_, G2_)}[zdir]
+        ax3.contourf(*args, zdir=zdir, offset=offset, levels=np.linspace(0.04, 1, 9),
+                     cmap=shade, alpha=0.55, zorder=0, antialiased=True)
+
     for name, spec in REGIONS.items():
         if not all(k in (a, b, c) for k, _, _ in spec["constraints"]):
             continue
@@ -1276,16 +1917,26 @@ def fig_space(df, ladders, out, axes=("x", "y", "t")):
         for k, op, v in spec["constraints"]:
             lo[k] = max(lo[k], v) if op == ">=" else lo[k]
             hi[k] = min(hi[k], v) if op == "<=" else hi[k]
-        _box3d(ax3, [(lo[a], hi[a]), (lo[b], hi[b]), (lo[c], hi[c])], spec["color"], 0.16)
+        _box3d(ax3, [(lo[a], hi[a]), (lo[b], hi[b]), (lo[c], hi[c])], spec["color"], 0.09)
         inside = int(satisfies(sub, spec["constraints"]).sum())
-        ax3.text((lo[a] + hi[a]) / 2, (lo[b] + hi[b]) / 2, hi[c] + 0.08,
-                 f"{name}: {inside}", fontsize=7.2, color=spec["color"], ha="center",
-                 fontweight="bold", zorder=8)
+        if LABEL_REGIONS:
+            # a small tag on the corner of the box rather than a heavy label over it,
+            # which competes with the points it is meant to be counting
+            ax3.text(hi[a], lo[b], hi[c] + 0.04, f"{name} · {inside}", fontsize=5.8,
+                     color=spec["color"], ha="right", va="bottom", zorder=8)
+
     for cl, style in CLUSTERS.items():
         m = (sub["cluster"] == cl).to_numpy()
         if m.any():
-            ax3.scatter(pa[m], pb[m], pc[m], s=17, color=style["color"], alpha=0.95,
-                        edgecolors="white", linewidths=0.35, depthshade=False, zorder=5)
+            ax3.scatter(pa[m], pb[m], pc[m], s=15, color=style["color"], alpha=0.95,
+                        edgecolors="white", linewidths=0.3, depthshade=True, zorder=5)
+    if overlay is not None and len(overlay):
+        ov = overlay.dropna(subset=[a, b, c])
+        if len(ov):
+            oa, ob = spread(ov[a].to_numpy(float), ov[b].to_numpy(float))
+            ax3.scatter(oa, ob, ov[c].to_numpy(float), s=42, marker="*",
+                        color=CLUSTERS["thesis"]["color"], edgecolors="white",
+                        linewidths=0.5, depthshade=False, zorder=7)
     for k, nm in zip((a, b, c), ("x", "y", "z")):
         getattr(ax3, f"set_{nm}lim")(0, 1)
         getattr(ax3, f"set_{nm}ticks")([0, 0.5, 1])
@@ -1295,27 +1946,32 @@ def fig_space(df, ladders, out, axes=("x", "y", "t")):
     ax3.set_zlabel(label_of(c), labelpad=-2, fontsize=6.6)
     ax3.tick_params(pad=0.4, labelsize=6.0)
     ax3.set_box_aspect((1, 1, 1))
-    ax3.view_init(elev=20, azim=-58)
+    ax3.view_init(elev=19, azim=-56)
     for pane in (ax3.xaxis.pane, ax3.yaxis.pane, ax3.zaxis.pane):
         pane.set_facecolor("white")
         pane.set_edgecolor(RULE)
-    ax3.text2D(0.0, 1.02, f"B   the corpus on ({a}, {b}, {c}); grey points are the same "
-               f"{len(sub)} paradigms\n      cast onto each wall",
-               transform=ax3.transAxes, fontsize=7.6, va="bottom", color=INK)
-    corpus_legend(fig, ncol=4, y=0.005, confidence=False)
+    for axis in (ax3.xaxis, ax3.yaxis, ax3.zaxis):
+        axis._axinfo["grid"].update(color="#E7EBED", linewidth=0.5)
+    ax3.text2D(0.02, 1.03, f"B   the corpus on ({a}, {b}, {c}); each wall carries the "
+               f"marginal density\n       of the {len(sub)} paradigms on the pair it "
+               f"spans", transform=ax3.transAxes, fontsize=7.6, va="bottom", color=INK)
+    corpus_legend(fig, ncol=4, y=0.005, confidence=False,
+                  overlay=overlay is not None and len(overlay) > 0)
     save(fig, out, "fig0_space")
 
 
 # --- figure 4: motor vs non-motor ----------------------------------------
 
-def fig_task_axes(df, ladders, out):
+def fig_task_axes(df, ladders, out, overlay=None):
     sub = df.dropna(subset=["x", "y", "x1", "y1"])
     fig, axs = plt.subplots(1, 3, figsize=(3 * PANEL_W + 1.5, PANEL_W + 1.0))
     square(axs[0], label_of("x", ladders), label_of("y", ladders))
     scatter_corpus(axs[0], sub, "x", "y")
+    scatter_overlay(axs[0], overlay, "x", "y")
     axs[0].set_title("A  motor plane", loc="left", fontsize=7.6)
     square(axs[1], label_of("x1", ladders), label_of("y1", ladders))
     scatter_corpus(axs[1], sub, "x1", "y1")
+    scatter_overlay(axs[1], overlay, "x1", "y1")
     axs[1].set_title("B  non-motor plane", loc="left", fontsize=7.6)
 
     square(axs[2], "difficulty", "timescale")
@@ -1328,14 +1984,15 @@ def fig_task_axes(df, ladders, out):
     axs[2].set_title("C  motor → non-motor displacement", loc="left", fontsize=7.6)
     axs[2].text(0.03, 0.96, f"mean displacement {d.mean():.2f}",
                 transform=axs[2].transAxes, fontsize=6.6, va="top", color="#54646D")
-    corpus_legend(fig, ncol=4, y=-0.10)
+    corpus_legend(fig, ncol=4, y=-0.10,
+                  overlay=overlay is not None and len(overlay) > 0)
     save(fig, out, "fig4_task_axes")
     return float(d.mean())
 
 
 # --- figure 5: coverage deficit and gaps ---------------------------------
 
-def fig_gaps(df, cfg, ladders, gaps, out):
+def fig_gaps(df, cfg, ladders, gaps, out, overlay=None):
     planes = [("x", "y"), ("x", "z"), ("x", "t"),
               ("y", "z"), ("y", "t"), ("z", "t")]
     axes = cfg.axes
@@ -1361,6 +2018,7 @@ def fig_gaps(df, cfg, ladders, gaps, out):
         ja, jb = spread(sub[a].to_numpy(float), sub[b].to_numpy(float), radius=0.010)
         ax.scatter(ja, jb, s=4.5, color="white", edgecolors=INK, linewidths=0.25,
                    alpha=0.9, zorder=4)
+        scatter_overlay(ax, overlay, a, b, size=26)
     cb = fig.colorbar(im, ax=axs, fraction=0.022, pad=0.015,
                       ticks=[0, 0.25, 0.5, 0.75, 1])
     cb.set_label("coverage deficit", fontsize=7)
@@ -1418,6 +2076,268 @@ def fig_accounts(df, thesis_point, out):
                      loc="left", fontsize=7.4)
     save(fig, out, "fig6_accounts")
     return f, n_eff
+
+
+# --- figure 6b: the account field over the design space -------------------
+#
+# Figure 6 asks what the field would call one design. This one asks how the
+# accounts are laid out over the space, which is the question the gap argument
+# needs: a region can be empty of papers and still sit inside a part of account
+# space that is already owned, and filling it would then settle nothing.
+
+def _live_accounts(F, floor=0.03, peak=0.30):
+    """Accounts worth a panel: either present everywhere or dominant somewhere.
+
+    Mean mass alone keeps accounts that never lead anywhere and only ever appear as
+    a few per cent of a distribution, which buys a near-white panel; the peak test
+    keeps an account that owns one corner of the plane and nothing else.
+    """
+    flat = F.reshape(-1, F.shape[-1])
+    return [a for i, a in enumerate(ACCOUNTS)
+            if flat[:, i].mean() > floor or flat[:, i].max() > peak]
+
+
+def _dominant_rgba(F, n_eff, min_neff=ACCOUNT_MIN_NEFF):
+    """Colour by the leading account, opacity by its margin, grey where unsupported."""
+    idx, margin = account_dominant(F)
+    rgba = np.zeros(F.shape[:2] + (4,))
+    for k, a in enumerate(ACCOUNTS):
+        m = idx == k
+        if not m.any():
+            continue
+        rgba[m, :3] = matplotlib.colors.to_rgb(ACCOUNT_COLOR[a])
+        rgba[m, 3] = 0.30 + 0.70 * np.clip(margin[m] / 0.5, 0, 1)
+    thin = n_eff < min_neff
+    rgba[thin, :3] = matplotlib.colors.to_rgb("#E7EBED")
+    rgba[thin, 3] = 0.85
+    return rgba
+
+
+def _overlay(ax, df, a, b, gaps=None, region=None, points=True):
+    if points:
+        pa, pb = spread(df[a].to_numpy(float), df[b].to_numpy(float))
+        ax.scatter(pa, pb, s=4.5, color=INK, alpha=0.45, linewidths=0, zorder=4)
+    if region:
+        (xa, xb, _) = rect_on_plane(REGIONS[region]["constraints"], a, b)
+        ax.add_patch(Rectangle((xa[0], xb[0]), xa[1] - xa[0], xb[1] - xb[0],
+                               facecolor="none", edgecolor=INK, lw=0.9, ls=(0, (3, 2)),
+                               zorder=5))
+    if gaps is not None and len(gaps):
+        for kind, marker, size in (("frontier", "o", 34), ("island", "*", 60)):
+            g = gaps[gaps["kind"] == kind]
+            if not len(g):
+                continue
+            ax.scatter(g[a], g[b], s=size, marker=marker, facecolors="none",
+                       edgecolors="#3B2E80", linewidths=1.1, zorder=6)
+
+
+def fig_account_field(df, ladders, gaps, out, plane=("x", "y"), n=61, sigma=SIGMA):
+    a, b = plane
+    lin, F, n_eff = account_plane(df, a, b, n=n, sigma=sigma)
+    live = _live_accounts(F)
+    ext = [0, 1, 0, 1]
+    xlab, ylab = label_of(a, short=True), label_of(b, short=True)
+
+    ncol = 4
+    nrow_small = int(np.ceil(len(live) / ncol))
+    fig = plt.figure(figsize=(7.4, 2.55 + 2.05 * nrow_small))
+    gs = fig.add_gridspec(1 + nrow_small, 12, hspace=0.62, wspace=1.5,
+                          height_ratios=[1.16] + [1] * nrow_small)
+
+    # A: which account owns each design
+    ax = fig.add_subplot(gs[0, 0:4])
+    ax.imshow(np.transpose(_dominant_rgba(F, n_eff), (1, 0, 2)), origin="lower",
+              extent=ext, interpolation="bilinear", zorder=1)
+    square(ax, xlab, ylab)
+    _overlay(ax, df.dropna(subset=[a, b]), a, b, gaps, region="G1")
+    panel_title(ax, "A  which account owns each design", width=26)
+
+    # B: how contested it is
+    ax = fig.add_subplot(gs[0, 4:8])
+    H = account_entropy(F)
+    H = np.where(n_eff < ACCOUNT_MIN_NEFF, np.nan, H)
+    cmap = matplotlib.colormaps["PuBuGn"].with_extremes(bad="#E7EBED")
+    im = ax.imshow(H.T, origin="lower", extent=ext, vmin=0, vmax=1, cmap=cmap,
+                   interpolation="bilinear", zorder=1)
+    square(ax, xlab, ylab)
+    _overlay(ax, df.dropna(subset=[a, b]), a, b, gaps, region="G1")
+    panel_title(ax, "B  how contested that ownership is", width=28)
+    # the label rides above a shortened bar rather than beside it: a rotated label
+    # is wide enough at this figure size to reach the panel to its right, and a
+    # full-height bar puts its own caption level with the next panel's title
+    cb = fig.colorbar(im, ax=ax, fraction=0.042, pad=0.03, ticks=[0, 0.5, 1],
+                      shrink=0.70, anchor=(0.0, 0.0))
+    cb.ax.set_title("entropy of $f$", fontsize=6.0, color="#42525B", pad=4)
+    cb.ax.tick_params(labelsize=5.8)
+    cb.outline.set_linewidth(0.4)
+
+    # C: how much corpus is actually behind the estimate
+    ax = fig.add_subplot(gs[0, 8:12])
+    im = ax.imshow(n_eff.T, origin="lower", extent=ext, cmap="Greys",
+                   vmin=0, vmax=max(np.nanmax(n_eff), 1), interpolation="bilinear",
+                   zorder=1)
+    ax.contour(lin, lin, n_eff.T, levels=[ACCOUNT_MIN_NEFF], colors=["#C1425A"],
+               linewidths=0.9, zorder=2)
+    square(ax, xlab, ylab)
+    _overlay(ax, df.dropna(subset=[a, b]), a, b, gaps, region="G1", points=False)
+    panel_title(ax, "C  rows behind the estimate", width=28,
+                sub=f"red contour: effective $n$ = {ACCOUNT_MIN_NEFF:g}")
+    cb = fig.colorbar(im, ax=ax, fraction=0.042, pad=0.03, shrink=0.70,
+                      anchor=(0.0, 0.0))
+    cb.ax.set_title("effective $n$", fontsize=6.0, color="#42525B", pad=4)
+    cb.ax.tick_params(labelsize=5.8)
+    cb.outline.set_linewidth(0.4)
+
+    # the individual account fields, on the same plane and the same colour scale
+    for i, acc in enumerate(live):
+        r, c = divmod(i, ncol)
+        ax = fig.add_subplot(gs[1 + r, 3 * c:3 * c + 3])
+        k = ACCOUNTS.index(acc)
+        Fa = np.where(n_eff < ACCOUNT_MIN_NEFF, np.nan, F[:, :, k])
+        cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
+            acc, ["#FFFFFF", ACCOUNT_COLOR[acc]]).with_extremes(bad="#E7EBED")
+        ax.imshow(Fa.T, origin="lower", extent=ext, vmin=0, vmax=1, cmap=cmap,
+                  interpolation="bilinear", zorder=1)
+        ax.contour(lin, lin, Fa.T, levels=[0.5], colors=["white"], linewidths=0.8,
+                   zorder=2)
+        # a panel with nothing underneath it needs its own tick labels, whether or not
+        # it happens to be in the last row of the grid: the final row is short
+        last = i + ncol >= len(live)
+        square(ax, xlab if last else "", ylab if c == 0 else "")
+        if not last:
+            ax.set_xticklabels([])
+        if c != 0:
+            ax.set_yticklabels([])
+        sub = df.dropna(subset=[a, b])
+        own = sub[sub["account"] == acc]
+        if len(own):
+            pa, pb = spread(own[a].to_numpy(float), own[b].to_numpy(float))
+            ax.scatter(pa, pb, s=5, color=INK, alpha=0.6, linewidths=0, zorder=4)
+        panel_title(ax, f"{acc} — {ACCOUNT_LABEL[acc]}", width=19, fontsize=6.6,
+                    sub=f"{len(own)} rows, dominant")
+
+    handles = [Patch(facecolor=ACCOUNT_COLOR[a_], edgecolor="none",
+                     label=f"{a_}  {ACCOUNT_LABEL[a_]}") for a_ in live]
+    handles.append(Patch(facecolor="#E7EBED", edgecolor="none",
+                         label=f"effective $n$ < {ACCOUNT_MIN_NEFF:g}"))
+    fig.legend(handles=handles, loc="lower center", ncol=3,
+               bbox_to_anchor=(0.5, -0.035), handletextpad=0.4, columnspacing=1.4,
+               fontsize=6.6)
+    save(fig, out, "fig6b_account_field")
+    return dict(plane=plane, live=live, entropy=float(np.nanmean(H)),
+                n_eff_median=float(np.median(n_eff)))
+
+
+# --- figure 6c: the account field where the argument needs it -------------
+
+def fig_account_probes(df, cfg, gaps, out, clus=None, sigma=SIGMA):
+    """f read off at the points the prose quotes, and per-cluster composition.
+
+    Panel A is the account-space version of the occupancy funnel: if the bar over
+    the gap looks like the bar over the cluster next to it, the gap is empty of
+    papers but not of theory.
+    """
+    axes = cfg.axes
+    probes = {}
+    # short names only: at ten probes across a text-width figure a tick label is
+    # about fifty points wide, which is one word. The coordinate of every probe is
+    # in account_probes.csv and in the report, and the gaps are in table 2.
+    for name in ("motor", "surprise", "bridge"):
+        m = df["cluster"] == name
+        sub = df[m].dropna(subset=axes)
+        if len(sub):
+            probes[f"{name}\ncentroid"] = sub[axes].mean().to_numpy()
+    for name in REGIONS:
+        probes[f"{name}\ncentroid"] = centroid(name, axes)
+    seen = {}
+    for _, g in gaps.iterrows():
+        seen[g["kind"]] = seen.get(g["kind"], 0) + 1
+        probes[f"{g['kind']}\ngap {seen[g['kind']]}"] = np.array([g[a] for a in axes])
+    thesis = df[df["thesis"]].dropna(subset=axes)
+    if len(thesis):
+        probes["thesis\nparadigm"] = thesis[axes].mean().to_numpy()
+
+    tab = account_probes(df, probes, axes=axes, sigma=sigma)
+    live = [a for a in ACCOUNTS if tab[a].max() > 0.02]
+
+    have_clus = clus is not None
+    fig = plt.figure(figsize=(7.4, 6.0 if have_clus else 3.8))
+    gs = fig.add_gridspec(2 if have_clus else 1, 2,
+                          height_ratios=[1.3, 1][:2 if have_clus else 1],
+                          hspace=0.78, wspace=0.32)
+
+    # A: f at every probe, stacked
+    ax = fig.add_subplot(gs[0, :])
+    bottom = np.zeros(len(tab))
+    xs = np.arange(len(tab))
+    for acc in live:
+        v = tab[acc].to_numpy(float)
+        ax.bar(xs, v, bottom=bottom, width=0.66, color=ACCOUNT_COLOR[acc],
+               edgecolor="white", linewidth=0.5, label=acc)
+        for xi, (vi, bi) in enumerate(zip(v, bottom)):
+            if vi > 0.13:
+                ax.text(xi, bi + vi / 2, acc, ha="center", va="center", fontsize=5.8,
+                        color="white", fontweight="bold")
+        bottom += v
+    ax.set_xticks(xs)
+    ax.set_xticklabels(tab["probe"], fontsize=5.8, linespacing=1.35)
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel(r"$P(c \mid u)$")
+    for xi, (ne, h) in enumerate(zip(tab["n_eff"], tab["entropy"])):
+        ax.text(xi, 1.015, f"$n_{{\\rm eff}}$ {ne:.1f}\n$H$ {h:.2f}", ha="center",
+                va="bottom", fontsize=5.4, color="#6C7C85")
+    panel_title(ax, "A  what the field would call each of these designs", width=90,
+                fontsize=7.6, pad=18)
+    ax.legend(fontsize=6.0, ncol=min(len(live), 8), loc="lower center",
+              bbox_to_anchor=(0.5, -0.40), frameon=False, columnspacing=1.0,
+              handlelength=1.1)
+
+    if have_clus:
+        # B: composition of the hand labels
+        ax = fig.add_subplot(gs[1, 0])
+        comp = account_composition(df, df["cluster"], axes=axes)
+        order = [c for c in CLUSTERS if c in comp.index]
+        _stack(ax, comp.loc[order], live,
+               [f"{CLUSTERS[c]['label']}\nn = {int(comp.loc[c, 'n'])}" for c in order])
+        panel_title(ax, "B  accounts inside each hand label", width=30)
+
+        # C: composition of the partition the geometry found
+        ax = fig.add_subplot(gs[1, 1])
+        # cluster_corpus resets the index of its own working frame, so the labels are
+        # matched back by paradigm id. Positional alignment happened to work while the
+        # corpus was a plain range index and broke the moment rows were held out.
+        by_id = dict(zip(clus["sub"]["paradigm_id"],
+                         [f"c{v}" for v in clus["labels"]]))
+        found = df["paradigm_id"].map(by_id)
+        comp = account_composition(df, found, axes=axes)
+        order = sorted(comp.index)
+        _stack(ax, comp.loc[order], live,
+               [f"{c}\nn = {int(comp.loc[c, 'n'])}" for c in order])
+        panel_title(ax, "C  accounts inside each discovered cluster", width=30)
+
+    save(fig, out, "fig6c_account_probes")
+    return tab
+
+
+def _stack(ax, comp, live, labels):
+    xs = np.arange(len(comp))
+    bottom = np.zeros(len(comp))
+    for acc in live:
+        v = comp[acc].to_numpy(float)
+        ax.bar(xs, v, bottom=bottom, width=0.6, color=ACCOUNT_COLOR[acc],
+               edgecolor="white", linewidth=0.5)
+        for xi, (vi, bi) in enumerate(zip(v, bottom)):
+            if vi > 0.14:
+                ax.text(xi, bi + vi / 2, acc, ha="center", va="center", fontsize=5.6,
+                        color="white", fontweight="bold")
+        bottom += v
+    ax.set_xticks(xs)
+    ax.set_xticklabels(["\n".join(textwrap.wrap(l.split("\n")[0], 13,
+                                                 break_long_words=False)
+                                  + l.split("\n")[1:]) for l in labels],
+                       fontsize=6.0, linespacing=1.3)
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel("share of account mass")
 
 
 # --- figure 7: audit ------------------------------------------------------
@@ -1515,8 +2435,12 @@ def fig_clusters(res, ladders, out):
     anywhere the colours disagree is a paradigm the label puts in one literature and
     the geometry puts in the other.
     """
-    sub, X, lab, given = res["sub"], res["X"], res["labels"], res["given"]
-    axes, C = res["axes"], res["centers"]
+    sub, lab, given = res["sub"], res["labels"], res["given"]
+    axes = res["axes"]
+    # rung units throughout: res["centers"] and res["X_raw"] are the inverse of the
+    # standardisation the clustering ran on, so every panel below shares the scale of
+    # the scatter and of the ladders
+    C, X = res["centers"], res.get("X_raw", res["X"])
     a, b = axes[0], axes[1]
     fig = plt.figure(figsize=(7.4, 5.1))
     gs = fig.add_gridspec(2, 3, height_ratios=[1, 1.0], hspace=0.52, wspace=0.44)
@@ -1549,12 +2473,19 @@ def fig_clusters(res, ladders, out):
                    alpha=0.92, zorder=3)
         if cents is not None:
             for j, cc in enumerate(cents):
-                ax.scatter([cc[axes.index(a)]], [cc[axes.index(b)]], s=80, marker="X",
-                           color=CLUSTER_PALETTE[j % 8], edgecolors=INK, linewidths=0.7,
-                           zorder=5)
-                ax.text(cc[axes.index(a)] + 0.06, cc[axes.index(b)] + 0.06, f"c{j}",
-                        fontsize=6.8, ha="left", color=CLUSTER_PALETTE[j % 8],
-                        fontweight="bold", zorder=6)
+                cx, cy = cc[axes.index(a)], cc[axes.index(b)]
+                ax.scatter([cx], [cy], s=80, marker="X", color=CLUSTER_PALETTE[j % 8],
+                           edgecolors=INK, linewidths=0.7, zorder=5)
+                # anchor the tag on whichever side keeps it inside the square, and
+                # clip it: a centroid near a corner used to push its label onto the
+                # panel next door
+                ha = "left" if cx < 0.82 else "right"
+                va = "bottom" if cy < 0.88 else "top"
+                ax.annotate(f"c{j}", (cx, cy), fontsize=6.8, ha=ha, va=va,
+                            xytext=(4 if ha == "left" else -4,
+                                    4 if va == "bottom" else -4),
+                            textcoords="offset points", annotation_clip=True,
+                            color=CLUSTER_PALETTE[j % 8], fontweight="bold", zorder=6)
         ax.set_title(title, loc="left", fontsize=7.6)
 
     # D -- contingency
@@ -1578,27 +2509,171 @@ def fig_clusters(res, ladders, out):
     # E -- what each discovered cluster is, on every axis
     ax = fig.add_subplot(gs[1, 1:])
     xs = np.arange(len(axes))
+    # the interquartile bars of different clusters land on the same tick, so each
+    # cluster is dodged by a fraction of the spacing; the centroid line keeps the
+    # same offset so a line and its spread stay visually attached
+    dodge = 0.13 if len(C) > 1 else 0.0
+    off = (np.arange(len(C)) - (len(C) - 1) / 2) * dodge
     for j, cc in enumerate(C):
         n = int((lab == j).sum())
-        ax.plot(xs, cc, "-o", ms=4, lw=1.4, color=CLUSTER_PALETTE[j % 8],
-                label=f"c{j}  (n = {n})")
-        for xi, v in zip(xs, cc):
+        ax.plot(xs + off[j], cc, "-o", ms=4, lw=1.4, color=CLUSTER_PALETTE[j % 8],
+                label=f"c{j}  (n = {n})", zorder=3)
+        for xi in range(len(axes)):
             lo, hi = np.percentile(X[lab == j, xi], [25, 75])
-            ax.plot([xi, xi], [lo, hi], color=CLUSTER_PALETTE[j % 8], lw=3.4, alpha=0.22,
-                    solid_capstyle="round", zorder=0)
+            ax.plot([xi + off[j]] * 2, [lo, hi], color=CLUSTER_PALETTE[j % 8], lw=3.4,
+                    alpha=0.25, solid_capstyle="round", zorder=0)
     ax.set_xticks(xs)
     ax.set_xticklabels([label_of(k, short=True) for k in axes], fontsize=8.5)
+    ax.set_xlim(-0.5, len(axes) - 0.5)
     for xi, k in enumerate(axes):
         ax.text(xi, -0.20, textwrap.shorten(
             re.sub(r"\s*\(.*?\)\s*$", "", ladders.get(k, {}).get("name", "")
                    or FALLBACK_LABEL[k]), 20, placeholder="…"),
             fontsize=5.4, ha="center", color="#6C7C85", transform=ax.get_xaxis_transform())
-    ax.set_ylim(-0.05, 1.05)
+    # the ladders run 0 to 1, so the panel does too, whatever units the clustering
+    # itself used; headroom at the top is for the legend, not for data
+    ax.set_ylim(-0.03, 1.28)
+    ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_yticklabels(["0", "", ".5", "", "1"])
     ax.set_ylabel("rung")
-    ax.legend(fontsize=6.2, ncol=min(4, len(C)), loc="upper left")
-    ax.set_title("E  centroid of each discovered cluster, with its interquartile range",
-                 loc="left", fontsize=7.6)
+    ax.axhline(1.0, color=RULE, lw=0.5, zorder=0)
+    ax.legend(fontsize=6.2, ncol=min(4, len(C)), loc="upper left", frameon=False,
+              handlelength=1.4, columnspacing=1.1, borderpad=0.2)
+    panel_title(ax, "E  centroid of each discovered cluster, with its interquartile "
+                    "range", width=72, fontsize=7.6,
+                sub="rung units; the partition itself was found on standardised axes")
     save(fig, out, "fig8_clusters")
+
+
+# --- figure 9: is the partition real, and is there a valley in it? --------
+
+def fig_separation(clus, diag, ladders, out):
+    """The tests behind the two-literature claim, in one figure.
+
+    A and B are the pair that matters, and only as a pair: A on its own is the
+    circular version of the test, since the direction it projects onto was chosen to
+    make the split look deep. B is what makes A admissible — the identical procedure
+    run on unimodal clouds, which produce valleys of their own.
+    """
+    sep = diag["separation"]
+    fig = plt.figure(figsize=(7.4, 5.2))
+    gs = fig.add_gridspec(2, 12, height_ratios=[1.12, 1], hspace=0.80, wspace=1.9)
+
+    # A -- the corpus projected onto its own best two-way direction
+    ax = fig.add_subplot(gs[0, 0:8])
+    v = sep["proj"]
+    lab2, given = sep["labels"], clus["given"]
+    bins = np.linspace(v.min(), v.max(), 26)
+    for j, col in ((0, "#1B3A5C"), (1, "#E08A2E")):
+        share = ""
+        if "composition" in sep:
+            c = sep["composition"][f"h{j}"]
+            top = sorted(c.items(), key=lambda kv: -kv[1])[:2]
+            share = "  " + ", ".join(f"{n} {g}" for g, n in top if n)
+        ax.hist(v[lab2 == j], bins=bins, color=col, alpha=0.62, zorder=2,
+                label=f"half {j}  (n = {int((lab2 == j).sum())}){share}")
+    order = np.sort(v)
+    lo, hi = np.quantile(order, [0.10, 0.90])
+    inner = order[(order >= lo) & (order <= hi)]
+    if len(inner) > 2:
+        j = int(np.argmax(np.diff(inner)))
+        ax.axvspan(inner[j], inner[j + 1], color="#C1425A", alpha=0.16, zorder=1)
+    ax.set_xlabel("projection onto the corpus's own best two-way direction")
+    ax.set_ylabel("paradigms")
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.32)
+    ax.legend(fontsize=6.0, loc="upper right", frameon=False)
+    panel_title(ax, "A  is the corpus thin between the two literatures?", width=52,
+                fontsize=7.6,
+                sub=(f"widest interior gap {sep['gap']:.2f} sd · two-component fit "
+                     f"wins by {sep['delta_bic']:.0f} in BIC · {sep['tied_fraction']:.0%} "
+                     f"of the projection is tied, which is the caveat on both"))
+
+    # B -- the same procedure on unimodal data, which is what makes A a test
+    ax = fig.add_subplot(gs[0, 8:12])
+    ax.hist(sep["null_gap"], bins=22, color=GREY, alpha=0.75, zorder=1,
+            label=f"unimodal reference\n({sep['n_null']} draws)")
+    ax.axvline(sep["gap"], color="#C1425A", lw=1.3, zorder=3)
+    pstr = ("$p$ < 0.01" if sep["p_gap"] < 0.01 else f"$p$ = {sep['p_gap']:.3f}")
+    lo_x, hi_x = ax.get_xlim()
+    ax.set_xlim(lo_x, max(hi_x, sep["gap"] * 1.08))
+    right_room = (sep["gap"] - lo_x) / (ax.get_xlim()[1] - lo_x) < 0.7
+    ax.text(sep["gap"], ax.get_ylim()[1] * 0.99,
+            (" corpus\n " if right_room else "corpus \n") + pstr, fontsize=6.0,
+            color="#C1425A", ha="left" if right_room else "right", va="top")
+    ax.set_xlabel("widest interior gap (sd)")
+    ax.set_ylabel("draws")
+    ax.legend(fontsize=5.6, loc="upper left", frameon=False)
+    panel_title(ax, "B  the same split, on data with no clusters in it", width=26,
+                sub=f"BIC margin $p$ = {sep['p_bic']:.3f}")
+
+    # C -- separation, and whether it is only a spread difference
+    ax = fig.add_subplot(gs[1, 0:3])
+    pa, pd_ = diag["permanova"], diag["permdisp"]
+    rows = [("PERMANOVA", pa["F"], pa["p"]), ("PERMDISP", pd_["F"], pd_["p"])]
+    ax.barh([0, 1], [r[1] for r in rows], color=["#4B2E83", "#AEB8BC"], height=0.5)
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels([r[0] for r in rows], fontsize=6.4)
+    ax.invert_yaxis()
+    for i, (_, f, p) in enumerate(rows):
+        ax.text(f + max(pa["F"], pd_["F"]) * 0.04, i,
+                f"F = {f:.1f}\n" + ("p < .001" if p < 0.001 else f"p = {p:.3f}"),
+                va="center", fontsize=5.8)
+    ax.set_xlim(0, max(pa["F"], pd_["F"]) * 1.75)
+    ax.set_xlabel("pseudo-$F$")
+    panel_title(ax, "C  location, and spread", width=22,
+                sub=f"$R^2$ = {pa['R2']:.2f}")
+
+    # D -- which axes carry it
+    ax = fig.add_subplot(gs[1, 3:6])
+    tab = diag["axis"]
+    xs = np.arange(len(tab))
+    ax.bar(xs, tab["eta2"], width=0.6, color="#4B2E83", edgecolor="white", linewidth=0.5)
+    ax.plot(xs, tab["eta2_null"], "o", ms=3.2, color=GREY, zorder=3, label="chance")
+    for xi, (e, p) in enumerate(zip(tab["eta2"], tab["p"])):
+        ax.text(xi, e + 0.03, "***" if p < 0.001 else "**" if p < 0.01
+                else "*" if p < 0.05 else "n.s.", ha="center", fontsize=5.6,
+                color=INK if p < 0.05 else "#6C7C85")
+    ax.set_xticks(xs)
+    ax.set_xticklabels([label_of(a, short=True) for a in tab["axis"]], fontsize=8)
+    ax.set_ylim(0, 1.14)
+    ax.set_ylabel(r"$\eta^2$")
+    ax.legend(fontsize=5.8, loc="upper right", frameon=False)
+    panel_title(ax, "D  which axes carry the split", width=22)
+
+    # E -- per-cluster stability
+    ax = fig.add_subplot(gs[1, 6:9])
+    jac = diag["jaccard"]
+    keys = sorted(jac)
+    ax.bar(range(len(keys)), [jac[g] for g in keys], width=0.6,
+           color=[CLUSTER_PALETTE[g % 8] for g in keys], edgecolor="white",
+           linewidth=0.5)
+    ax.set_xlim(-0.62, len(keys) - 0.5 + 1.55)
+    for lvl, txt in ((0.6, "dissolved"), (0.75, "stable")):
+        ax.plot([-0.62, len(keys) - 0.46], [lvl, lvl], color=GREY, lw=0.6, ls="--",
+                zorder=0)
+        ax.text(len(keys) - 0.40, lvl, txt, fontsize=5.2, ha="left", va="center",
+                color="#6C7C85")
+    for i, g in enumerate(keys):
+        ax.text(i, jac[g] + 0.02, f"{jac[g]:.2f}", ha="center", fontsize=5.8)
+    ax.set_xticks(range(len(keys)))
+    ax.set_xticklabels([f"c{g}" for g in keys], fontsize=7)
+    ax.set_ylim(0, 1.1)
+    ax.set_ylabel("mean Jaccard")
+    panel_title(ax, "E  which clusters survive resampling", width=22)
+
+    # F -- how many clusters replicate
+    ax = fig.add_subplot(gs[1, 9:12])
+    st = diag["strength"]
+    ax.plot(st["k"], st["prediction_strength"], "-o", ms=3.2, lw=1.1, color=INK)
+    ax.axhline(0.8, color="#C1425A", lw=0.7, ls="--", zorder=0)
+    ax.text(st["k"].max(), 0.815, "cutoff", fontsize=5.4, ha="right", color="#C1425A")
+    ax.axvline(clus["k"], color=CLUSTERS["surprise"]["color"], lw=0.9, ls=":", zorder=0)
+    ax.set_xlabel("clusters $k$")
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("prediction strength")
+    panel_title(ax, "F  how many clusters replicate", width=22)
+
+    save(fig, out, "fig9_separation")
 
 
 # --- appendix figures -----------------------------------------------------
@@ -1720,12 +2795,23 @@ def html_payload(df, ladders, cfg, gaps, raw, clus=None):
         }
 
     pts = []
+    pcols = [f"p_{a}" for a in ACCOUNTS]
+    have_p = set(pcols) <= set(df.columns)
     for _, r in df.iterrows():
+        # the page estimates f itself so that it can react to sigma and to the plane,
+        # which means it needs the distribution over accounts rather than the argmax:
+        # with one-hot labels the same kernel regression collapses onto whichever
+        # account the two or three nearest rows happen to carry
+        pa = [float(r[c]) if have_p and np.isfinite(r[c]) else 0.0 for c in pcols]
+        if sum(pa) <= 0 and r["account"] in ACCOUNTS:
+            pa = [1.0 if a == r["account"] else 0.0 for a in ACCOUNTS]
+        s = sum(pa)
+        pa = [round(v / s, 4) for v in pa] if s > 0 else None
         pts.append({
             "id": r["paradigm_id"], "key": r["citekey"] or r["paradigm_id"],
             "title": r["title"][:90], "year": num(r["year"]),
             "cluster": r["cluster"], "conf": r["confidence"], "w": num(r["w"]),
-            "acc": r["account"], "topic": r["topic"],
+            "acc": r["account"], "pacc": pa, "topic": r["topic"],
             "note": (r["task_note"] or r["scoring_note"] or r["summary"])[:180],
             **{a: num(r[a]) for a in ALL_AXES},
         })
@@ -1743,6 +2829,9 @@ def html_payload(df, ladders, cfg, gaps, raw, clus=None):
                 "principal": cfg.axes, "grid": cfg.grid,
                 "emptyDeficit": EMPTY_DEFICIT},
         "accounts": ACCOUNTS,
+        "accountLabel": ACCOUNT_LABEL,
+        "accountColor": ACCOUNT_COLOR,
+        "accountMinNeff": ACCOUNT_MIN_NEFF,
         "gaps": gaps.to_dict("records"),
         "audit": {"dispositions": [[k, int(v)] for k, v in disp],
                   "records": int(len(raw)),
@@ -1862,12 +2951,7 @@ __PLOTLY__
   <p class="eyebrow">paradigm space · __NPARA__ scored paradigms · __NRECORDS__ records</p>
   <h1>Towards a formal literature review <br>
       <em>surprising events during ongoing motor control</em></h1>
-  <p class="sub">We have developed a low-dimensional geometrical representation of the 
-    experimental paradigms used to study the processing and integration of surprising 
-    events during ongoing behaviour. Every experimental paradigm in the reviewed literature
-    is a point in this space. The axes are interpretable variables defining the structure
-    of the paradigm: 
-    : how much capacity the task commits,
+  <p class="sub">Every experimental design is a point: how much capacity the task commits,
      how long the motor command stays open to revision, how deep a hierarchy the
      perturbing event's statistics demand, and how much of the task the event carries.
      One row of the workbook is one paradigm, so a paper running four experiments occupies
@@ -1977,6 +3061,44 @@ __PLOTLY__
     <div><p class="eyebrow">accounts by corpus mass</p>
       <div class="plot"><div id="push" style="height:280px;width:100%"></div></div></div>
   </div>
+  <p class="note" id="accnote"></p>
+</section>
+
+<section>
+  <p class="eyebrow">step 4b — the same map, over the whole space</p>
+  <h2>Which account owns which design</h2>
+  <p class="lead">Evaluating f on a grid rather than at a point turns the account labels
+     into a field over the space, and lets the emptiness of a region be checked in
+     account space as well as in paradigm space. The kernel is conditioned on the two
+     plotted coordinates only, so the plane below is a marginal of the field rather than
+     a slice through fixed values of the other two. Where the estimate rests on fewer
+     than <span class="coord" id="minneff"></span> effective rows the cell is drawn as
+     unsupported rather than as a confident answer: that pale region is the honest part
+     of the picture.</p>
+  <div class="controls">
+    <div class="ctl"><label>plane</label><select id="aplane"></select></div>
+    <div class="ctl"><label>show</label><select id="amode">
+      <option value="dominant">which account owns each design</option>
+      <option value="entropy">how contested that ownership is</option>
+      <option value="support">rows behind the estimate</option>
+      <option value="single">one account at a time</option>
+    </select></div>
+    <div class="ctl"><label>account</label><select id="aacc"></select></div>
+    <div class="ctl"><label>show</label>
+      <button class="seg" id="apts" aria-pressed="true">paradigms</button>
+      <button class="seg" id="agap" aria-pressed="true">gaps</button></div>
+    <div class="readout">accounts on this plane<b id="alive">—</b>
+      <span id="aentropy"></span></div>
+  </div>
+  <div class="plot"><div id="afield" style="height:470px;width:100%"></div></div>
+  <div class="swatches" id="aswatch"></div>
+  <p class="eyebrow" style="margin-top:26px">account mass inside each group</p>
+  <div class="plot"><div id="acomp" style="height:300px;width:100%"></div></div>
+  <p class="note">The bars are the h layer restricted to a partition of the corpus: the
+     hand labels first, then, when the page was built with clustering on, the groups the
+     geometry found. Two literatures that turn out to hold the same accounts in the same
+     proportions are two names for one body of work; two that do not are the reason the
+     gap between them is worth running.</p>
 </section>
 
 <section id="fitsec">
@@ -2050,6 +3172,7 @@ const AGREE_LAB = {'agree':'label and geometry agree', 'disagree':'they disagree
                    'unclustered':'not clustered'};
 D.pts.forEach(p => { p.found = (FIT && FIT.found[p.id] !== undefined) ? FIT.found[p.id] : null; });
 state.fit = {plane:['x','t'], given:'all', found:'all', disagree:false};
+state.acc = {plane:['x','y'], mode:'dominant', account:'SAL', pts:true, gaps:true};
 
 const el = id => document.getElementById(id);
 const fmt = v => (v===null||v===undefined) ? '—' : (+v).toFixed(2);
@@ -2309,7 +3432,8 @@ function drawAccounts(){
     const k = p.w*Math.exp(-d/s2); if (v[p.acc] !== undefined) v[p.acc] += k; tot += k; });
   const keys = D.accounts.filter(a => tot > 0 && v[a]/tot > 0.004);
   Plotly.react('facc', [{type:'bar', orientation:'h', x:keys.map(a=>v[a]/tot),
-      y:keys, marker:{color:'#7A5EA8'}, hovertemplate:'%{y}: %{x:.2f}<extra></extra>'}], {
+      y:keys, marker:{color:keys.map(a=>D.accountColor[a] || '#7A5EA8')},
+      hovertemplate:'%{y}: %{x:.2f}<extra></extra>'}], {
     margin:{l:46,r:14,t:8,b:34}, paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'white',
     xaxis:{title:{text:'P(account | design at box centre)', font:{size:11}}, range:[0,1]}
   }, {displayModeBar:false, responsive:true});
@@ -2318,10 +3442,225 @@ function drawAccounts(){
   pool().forEach(p => { if (p.acc && mass[p.acc] !== undefined) { mass[p.acc] += p.w; mt += p.w; } });
   const mk = D.accounts.filter(a => mt > 0 && mass[a]/mt > 0.001);
   Plotly.react('push', [{type:'bar', x:mk, y:mk.map(a=>mass[a]/mt),
-      marker:{color:'#7A5EA8'}, hovertemplate:'%{x}: %{y:.2f}<extra></extra>'}], {
+      marker:{color:mk.map(a=>D.accountColor[a] || '#7A5EA8')},
+      hovertemplate:'%{x}: %{y:.2f}<extra></extra>'}], {
     margin:{l:46,r:14,t:8,b:34}, paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'white',
     yaxis:{title:{text:'share of corpus mass', font:{size:11}}}
   }, {displayModeBar:false, responsive:true});
+
+  el('accnote').textContent = tot > 0
+    ? `the estimate at the box centre rests on an effective ${(tot*tot/P.reduce((s,p)=>{
+        const d=(c.x-p.x)**2+(c.y-p.y)**2+(c.z-p.z)**2+(c.t-p.t)**2;
+        const k=p.w*Math.exp(-d/s2); return s+k*k; },0)).toFixed(1)} rows`
+    : 'no scored row carries an account near this box';
+}
+
+/* ---------- step 4b: the account field over the space ----------
+   Same Nadaraya-Watson estimator as figure 6b, conditioned on the two plotted
+   coordinates only, so what is drawn is a marginal of the field rather than a slice
+   through fixed values of the other axes. Recomputed in the browser rather than
+   shipped as an image, because it has to react to sigma and to the plane. */
+const NACC = () => D.accounts.length;
+function accRows(){
+  return pool().filter(p => p.pacc && p.cluster !== 'thesis');
+}
+function accField(a, b, n, sigma){
+  const P = accRows().filter(p => p[a] !== null && p[b] !== null);
+  const lin = Array.from({length:n}, (_,i)=>i/(n-1));
+  const K = NACC(), s2 = 2*sigma*sigma;
+  const F = [], NE = [];
+  for (let i=0;i<n;i++){
+    F.push([]); NE.push(new Float64Array(n));
+    for (let j=0;j<n;j++){
+      const v = new Float64Array(K);
+      let s = 0, ss = 0;
+      for (const p of P){
+        const k = p.w*Math.exp(-((lin[i]-p[a])**2 + (lin[j]-p[b])**2)/s2);
+        if (k < 1e-9) continue;
+        s += k; ss += k*k;
+        for (let m=0;m<K;m++) v[m] += k*p.pacc[m];
+      }
+      if (s > 0) for (let m=0;m<K;m++) v[m] /= s;
+      F[i].push(v);
+      NE[i][j] = s > 0 ? s*s/ss : 0;
+    }
+  }
+  return {lin, F, NE, n:P.length};
+}
+function accEntropy(v, live){
+  let h = 0;
+  for (let m=0;m<v.length;m++) if (v[m] > 0) h -= v[m]*Math.log(v[m]);
+  return h/Math.log(Math.max(live, 2));
+}
+function accLive(F){
+  const K = NACC(), mass = new Float64Array(K);
+  let cells = 0;
+  F.forEach(row => row.forEach(v => { cells++; for (let m=0;m<K;m++) mass[m] += v[m]; }));
+  return D.accounts.filter((a,m) => cells && mass[m]/cells > 0.02);
+}
+/* one heatmap per account, each showing only the cells that account leads: colour
+   names the account and intensity is its margin over the runner-up, which a single
+   categorical heatmap cannot express. */
+function drawAccountField(){
+  const [a,b] = state.acc.plane, n = 45;
+  const {lin, F, NE, n:nrows} = accField(a, b, n, state.sigma);
+  const live = accLive(F);
+  const thin = D.accountMinNeff;
+  const K = NACC();
+  const blank = () => Array.from({length:n}, ()=>new Array(n).fill(null));
+  const traces = [];
+  let meanH = 0, cells = 0;
+
+  const hover = blank();
+  for (let i=0;i<n;i++) for (let j=0;j<n;j++){
+    const v = F[i][j];
+    const top = D.accounts.map((c,m)=>[c,v[m]]).sort((p,q)=>q[1]-p[1]).slice(0,3)
+                 .filter(p=>p[1]>0.02).map(p=>`${p[0]} ${p[1].toFixed(2)}`).join(' · ');
+    hover[j][i] = `${a} ${lin[i].toFixed(2)} · ${b} ${lin[j].toFixed(2)}`
+      + `<br>${top || 'no account nearby'}<br>effective n ${NE[i][j].toFixed(1)}`;
+    if (NE[i][j] >= thin){ meanH += accEntropy(v, live.length); cells++; }
+  }
+  meanH = cells ? meanH/cells : 0;
+
+  if (state.acc.mode === 'dominant'){
+    live.forEach(accName => {
+      const m = D.accounts.indexOf(accName);
+      const z = blank();
+      let any = false;
+      for (let i=0;i<n;i++) for (let j=0;j<n;j++){
+        if (NE[i][j] < thin) continue;
+        const v = F[i][j];
+        let best = -1, second = -1;
+        for (let q=0;q<K;q++){ if (v[q] > best){ second = best; best = v[q]; }
+                               else if (v[q] > second) second = v[q]; }
+        if (v[m] === best && best > 0){ z[j][i] = 0.3 + 0.7*Math.min((best-second)/0.5, 1); any = true; }
+      }
+      if (!any) return;
+      traces.push({type:'heatmap', x:lin, y:lin, z, zmin:0, zmax:1, showscale:false,
+        colorscale:[[0,rgba(D.accountColor[accName],0.10)],[1,D.accountColor[accName]]],
+        text:hover, hovertemplate:'%{text}<extra></extra>', hoverongaps:false, zsmooth:'best'});
+    });
+  } else if (state.acc.mode === 'single'){
+    const m = D.accounts.indexOf(state.acc.account);
+    const z = blank();
+    for (let i=0;i<n;i++) for (let j=0;j<n;j++)
+      if (NE[i][j] >= thin) z[j][i] = F[i][j][m];
+    traces.push({type:'heatmap', x:lin, y:lin, z, zmin:0, zmax:1, zsmooth:'best',
+      colorscale:[[0,'#FFFFFF'],[1,D.accountColor[state.acc.account]]],
+      colorbar:{title:{text:`P(${state.acc.account} | design)`, font:{size:11}},
+                thickness:11, len:0.85},
+      text:hover, hovertemplate:'%{text}<extra></extra>', hoverongaps:false});
+  } else if (state.acc.mode === 'entropy'){
+    const z = blank();
+    for (let i=0;i<n;i++) for (let j=0;j<n;j++)
+      if (NE[i][j] >= thin) z[j][i] = accEntropy(F[i][j], live.length);
+    traces.push({type:'heatmap', x:lin, y:lin, z, zmin:0, zmax:1, zsmooth:'best',
+      colorscale:'PuBuGn', reversescale:true,
+      colorbar:{title:{text:'normalised entropy of f', font:{size:11}},
+                thickness:11, len:0.85},
+      text:hover, hovertemplate:'%{text}<extra></extra>', hoverongaps:false});
+  } else {
+    const z = blank();
+    let mx = 0;
+    for (let i=0;i<n;i++) for (let j=0;j<n;j++){ z[j][i] = NE[i][j]; if (NE[i][j] > mx) mx = NE[i][j]; }
+    traces.push({type:'heatmap', x:lin, y:lin, z, zmin:0, zmax:mx || 1, zsmooth:'best',
+      colorscale:'Greys',
+      colorbar:{title:{text:'effective rows behind f', font:{size:11}},
+                thickness:11, len:0.85},
+      text:hover, hovertemplate:'%{text}<extra></extra>'});
+    traces.push({type:'contour', x:lin, y:lin, z, showscale:false, hoverinfo:'skip',
+      contours:{start:thin, end:thin, size:1, coloring:'none', showlabels:false},
+      line:{color:'#C1425A', width:1.4}});
+  }
+
+  if (state.acc.pts){
+    const P = accRows().filter(p => p[a] !== null && p[b] !== null);
+    const s = spread(P, a, b, a, 0.012);
+    traces.push({type:'scatter', mode:'markers', showlegend:false,
+      x:s.map(v=>v.x), y:s.map(v=>v.y),
+      text:P.map(p=>`<b>${p.key}</b><br>${p.title}<br>dominant account ${p.acc||'—'}`),
+      hovertemplate:'%{text}<extra></extra>',
+      marker:{size:6, color:P.map(p=>D.accountColor[p.acc] || '#8A9AA2'),
+              line:{width:0.9, color:'white'}}});
+  }
+  if (state.acc.gaps){
+    ['frontier','island'].forEach(kind => {
+      const g = D.gaps.filter(v=>v.kind===kind);
+      if (!g.length) return;
+      traces.push({type:'scatter', mode:'markers', name:kind+' gap',
+        x:g.map(v=>v[a]), y:g.map(v=>v[b]),
+        text:g.map(v=>`${kind} gap<br>`+PRIN.map(k=>`${k} ${fmt(v[k])}`).join(' · ')),
+        hovertemplate:'%{text}<extra></extra>',
+        marker:{symbol: kind==='frontier'?'circle-open':'star', size: kind==='frontier'?13:15,
+                color:'#3B2E80', line:{width:2, color:'#3B2E80'}}});
+    });
+  }
+  Plotly.react('afield', traces, {
+    margin:{l:52,r:10,t:10,b:46}, paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'#E7EBED',
+    xaxis:{title:{text:D.axes[a].label, font:{size:12}}, range:[0,1], constrain:'domain'},
+    yaxis:{title:{text:D.axes[b].label, font:{size:12}}, range:[0,1],
+           scaleanchor:'x', scaleratio:1},
+    legend:{orientation:'h', y:1.06, x:0, font:{size:11}}
+  }, {displayModeBar:false, responsive:true});
+
+  el('alive').textContent = live.length;
+  el('aentropy').textContent = `mean entropy ${meanH.toFixed(2)} over the supported plane`
+    + ` · ${nrows} rows carry an account`;
+  el('aswatch').innerHTML = live.map(c =>
+      `<span class="s"><span class="dot" style="background:${D.accountColor[c]}"></span>`
+      + `${c} — ${D.accountLabel[c]}</span>`).join('')
+    + `<span class="s"><span class="dot" style="background:#E7EBED"></span>`
+    + `effective n &lt; ${thin}</span>`;
+}
+/* the h layer restricted to a partition: hand labels, and the discovered clusters
+   when the page was built with -k */
+function drawAccountComposition(){
+  const K = NACC();
+  const groups = [];
+  Object.keys(D.clusters).forEach(g => {
+    const rows = D.pts.filter(p => p.pacc && p.cluster === g);
+    if (rows.length) groups.push({name:(D.clusters[g].label||g)+`<br>n = ${rows.length}`, rows});
+  });
+  if (FIT) FIT.foundNames.forEach((nm,i) => {
+    const rows = D.pts.filter(p => p.pacc && p.found === i);
+    if (rows.length) groups.push({name:nm+`<br>n = ${rows.length}`, rows});
+  });
+  const share = g => {
+    const v = new Float64Array(K); let tot = 0;
+    g.rows.forEach(p => { for (let m=0;m<K;m++) v[m] += p.w*p.pacc[m]; tot += p.w; });
+    return tot ? Array.from(v, x => x/tot) : Array.from(v);
+  };
+  const S = groups.map(share);
+  const traces = D.accounts.map((c,m) => ({
+    type:'bar', name:c, x:groups.map(g=>g.name), y:S.map(v=>v[m]),
+    marker:{color:D.accountColor[c]},
+    hovertemplate:`${c} — ${D.accountLabel[c]}: %{y:.2f}<extra></extra>`
+  })).filter((t,m) => S.some(v => v[m] > 0.01));
+  Plotly.react('acomp', traces, {
+    barmode:'stack', margin:{l:52,r:10,t:10,b:52}, paper_bgcolor:'rgba(0,0,0,0)',
+    plot_bgcolor:'white', bargap:0.42,
+    yaxis:{title:{text:'share of account mass', font:{size:11}}, range:[0,1]},
+    legend:{orientation:'h', y:1.08, x:0, font:{size:10}}
+  }, {displayModeBar:false, responsive:true});
+}
+function buildAccountControls(){
+  const planes = [];
+  for (let i=0;i<PRIN.length;i++) for (let j=i+1;j<PRIN.length;j++) planes.push([PRIN[i],PRIN[j]]);
+  el('aplane').innerHTML = planes.map(([a,b]) =>
+    `<option value="${a},${b}">${a} vs ${b}</option>`).join('');
+  el('aplane').value = state.acc.plane.join(',');
+  el('aplane').onchange = () => { state.acc.plane = el('aplane').value.split(','); drawAccountField(); };
+  el('aacc').innerHTML = D.accounts.map(c =>
+    `<option value="${c}">${c} — ${D.accountLabel[c]}</option>`).join('');
+  el('aacc').value = state.acc.account;
+  el('aacc').onchange = () => { state.acc.account = el('aacc').value;
+    state.acc.mode = 'single'; el('amode').value = 'single'; drawAccountField(); };
+  el('amode').onchange = () => { state.acc.mode = el('amode').value; drawAccountField(); };
+  el('apts').onclick = () => { state.acc.pts = !state.acc.pts;
+    el('apts').setAttribute('aria-pressed', state.acc.pts); drawAccountField(); };
+  el('agap').onclick = () => { state.acc.gaps = !state.acc.gaps;
+    el('agap').setAttribute('aria-pressed', state.acc.gaps); drawAccountField(); };
+  el('minneff').textContent = D.accountMinNeff;
 }
 
 /* ---------- step 5: found clusters against the hand labels ----------
@@ -2515,7 +3854,7 @@ function buildControls(){
   el('bs').addEventListener('input', () => {
     state.sigma = +el('bs').value; el('vs').textContent = state.sigma.toFixed(3);
     el('fsig').textContent = state.sigma.toFixed(3); });
-  el('bs').addEventListener('change', () => { drawDensity(); drawAccounts(); });
+  el('bs').addEventListener('change', () => { drawDensity(); drawAccounts(); drawAccountField(); });
   el('vs').textContent = state.sigma.toFixed(3);
 
   const toggle = (id, key, after) => el(id).onclick = () => {
@@ -2566,8 +3905,11 @@ function buildControls(){
 }
 buildControls();
 buildFitControls();
+buildAccountControls();
 refreshBox();
 drawDensity();
+drawAccountField();
+drawAccountComposition();
 refreshFit();
 </script>
 </body></html>
@@ -2618,7 +3960,8 @@ def sensitivity(df, cfg, sigmas=(0.06, 0.09, 0.12, 0.15)):
     return pd.DataFrame(rows)
 
 
-def report(df, raw, cfg, gaps, counts, mean_disp, f_thesis, n_eff, corr, path, clus=None):
+def report(df, raw, cfg, gaps, counts, mean_disp, f_thesis, n_eff, corr, path,
+           clus=None, acc=None, diag=None, held=None):
     sub = df.dropna(subset=PRINCIPAL)
     P, w, pub = matrix(df[~df["thesis"]], cfg.axes)
     lines = []
@@ -2672,6 +4015,62 @@ def report(df, raw, cfg, gaps, counts, mean_disp, f_thesis, n_eff, corr, path, c
     for _, g in gaps.iterrows():
         add(f"  {g['kind']:<9} ({', '.join(f'{g[a]:.2f}' for a in cfg.axes)})"
             f"  reach {g['reach']:.3f}")
+    if acc is not None:
+        add("")
+        add("account space")
+        push = pushforward(df[~df["thesis"]])
+        add("  pushforward f#mu: " + ", ".join(
+            f"{k} {v:.2f}" for k, v in sorted(push.items(), key=lambda kv: -kv[1])
+            if v > 0.005))
+        pr = acc["pred"]
+        if np.isfinite(pr["logloss"]):
+            add(f"  does the design predict the account? leave-one-out over "
+                f"{pr['n']} rows carrying one:")
+            add(f"    log loss {pr['logloss']:.3f} against {pr['logloss_null']:.3f} "
+                f"for permuted labels (p = {pr['p']:.4f})")
+            add(f"    top-1 accuracy {pr['accuracy']:.1%} against "
+                f"{pr['accuracy_null']:.1%}")
+        add(f"  account field drawn on the "
+            f"({', '.join(acc['field']['plane'])}) plane; accounts carrying "
+            f"more than 2% of it: {', '.join(acc['field']['live'])}")
+        add(f"  mean normalised entropy of f over the supported plane "
+            f"{acc['field']['entropy']:.2f} "
+            f"(0 = one account owns every design, 1 = all of them equally)")
+        add("  f at the points the prose quotes (n_eff is the effective number of "
+            "rows behind each):")
+        tab = acc["probes"]
+        cols = [a for a in ACCOUNTS if tab[a].max() > 0.02]
+        add("    " + "probe".ljust(30) + "n_eff".rjust(7) + "H".rjust(6)
+            + "".join(c.rjust(7) for c in cols))
+        for _, r in tab.iterrows():
+            add("    " + r["probe"].replace("\n", " ")[:30].ljust(30)
+                + f"{r['n_eff']:7.1f}" + f"{r['entropy']:6.2f}"
+                + "".join(f"{r[c]:7.2f}" for c in cols))
+    if held is not None and len(held):
+        sub_h = held.dropna(subset=cfg.axes)
+        add("")
+        add(f"held-out thesis paradigms ({len(sub_h)} scored on all principal axes)")
+        add("  these took no part in the density, the region counts, the gap search,")
+        add("  the clustering or the account field: this is where the map puts them")
+        P, w, corpus = matrix(df, cfg.axes)
+        for _, r in sub_h.iterrows():
+            u = r[cfg.axes].to_numpy(float)
+            d = np.exp(-((P - u) ** 2).sum(1) / (2 * cfg.sigma ** 2))
+            reach = float((w * d).sum() / w.sum())
+            j = int(((P - u) ** 2).sum(1).argmin())
+            inside = [n for n, spec in REGIONS.items()
+                      if all((u[cfg.axes.index(k)] >= v) if op == ">="
+                             else (u[cfg.axes.index(k)] <= v)
+                             for k, op, v in spec["constraints"])]
+            add(f"  {str(r['citekey'] or r['paradigm_id'])[:26]:<26} "
+                + "(" + ", ".join(f"{u[i]:.2f}" for i in range(len(cfg.axes))) + ")"
+                + f"  in {'+'.join(inside) if inside else 'no region'}"
+                + f", reach {reach:.3f}"
+                + f", nearest published {str(corpus.iloc[j]['citekey'])[:22]} at "
+                  f"{np.linalg.norm(P[j] - u):.2f}")
+        for n in REGIONS:
+            k = int(satisfies(sub_h, REGIONS[n]["constraints"]).sum())
+            add(f"  {n}: {counts[n]} published, {k} thesis")
     add("")
     add(f"mean motor → non-motor displacement {mean_disp:.2f}")
     add("axis collinearity above 0.5:")
@@ -2702,16 +4101,62 @@ def report(df, raw, cfg, gaps, counts, mean_disp, f_thesis, n_eff, corr, path, c
             f"AMI {clus['ami']:.3f}, best one-to-one agreement {clus['agreement']:.1%}")
         add(f"  silhouette {clus['silhouette']:.3f}, bootstrap stability "
             f"{clus['stability']:.3f}")
+        add("  centroids in rung units (the partition was found on standardised axes)")
         for j, c in enumerate(clus["centers"]):
             n = int((clus["labels"] == j).sum())
             add(f"  c{j} (n = {n}): " +
-                ", ".join(f"{a} {v:.2f}" for a, v in zip(clus["axes"], c)))
+                ", ".join(f"{a} {v + 0.0:.2f}" if abs(v) > 5e-3 else f"{a} 0.00"
+                          for a, v in zip(clus["axes"], c)))
         M = clus["contingency"]
         add("  " + "found".ljust(8) + "".join(g[:9].rjust(10) for g in clus["given_names"]))
         for i, row_ in enumerate(M):
             add("  " + f"c{i}".ljust(8) + "".join(str(v).rjust(10) for v in row_))
         add("  k sweep:")
         add("    " + clus["curve"].round(3).to_string(index=False).replace("\n", "\n    "))
+    if diag is not None:
+        pa, pdz = diag["permanova"], diag["permdisp"]
+        add("")
+        add("cluster diagnostics (all nulls are permutation or bootstrap)")
+        add(f"  PERMANOVA  pseudo-F {pa['F']:.2f}, R2 {pa['R2']:.2f}, "
+            f"p = {pa['p']:.4f} ({pa['n']} rows, {pa['a']} groups)")
+        add(f"  PERMDISP   pseudo-F {pdz['F']:.2f}, p = {pdz['p']:.4f}  "
+            "(a small p here means the groups also differ in spread, so the "
+            "location claim needs care)")
+        add("    within-group dispersion: " + ", ".join(
+            f"c{g} {v:.2f}" for g, v in pdz["spread"].items()))
+        add("  variance explained per axis (eta squared, permutation p):")
+        for _, r in diag["axis"].iterrows():
+            add(f"    {r['axis']:<4} eta2 {r['eta2']:.3f}  p = {r['p']:.4f}   "
+                f"(chance {r['eta2_null']:.3f})")
+        add("  pairwise Hedges g per axis:")
+        add("    " + diag["pairwise"].round(2).to_string(index=False)
+            .replace("\n", "\n    "))
+        add("  cluster-wise bootstrap stability (Hennig; <0.6 dissolved, "
+            ">0.75 stable):")
+        add("    " + ", ".join(f"c{g} {v:.2f}" for g, v in
+                               sorted(diag["jaccard"].items())))
+        add("  prediction strength (Tibshirani and Walther; cutoff 0.8):")
+        add("    " + diag["strength"].round(3).to_string(index=False)
+            .replace("\n", "\n    "))
+        sep = diag["separation"]
+        if sep is not None:
+            add("  valley: the corpus split in two by itself and projected onto its "
+                "own best direction,")
+            add("  against unimodal references put through exactly the same procedure")
+            add(f"    widest interior gap {sep['gap']:.3f} sd against "
+                f"{sep['gap_null_mean']:.3f} for the references, p = {sep['p_gap']:.4f}")
+            add(f"    two-component BIC margin {sep['delta_bic']:.1f} against "
+                f"{sep['bic_null_mean']:.1f} for the references, p = {sep['p_bic']:.4f}")
+            add(f"    ({sep['n_null']} references drawn from a Gaussian with the "
+                "corpus covariance)")
+            if "composition" in sep:
+                for j in (0, 1):
+                    c = sep["composition"][f"h{j}"]
+                    add(f"    half {j}: " + ", ".join(f"{g} {n}" for g, n in c.items()
+                                                      if n))
+            add(f"    {sep['tied_fraction']:.0%} of the projected values are tied; the "
+                "references are continuous and have none, so both p-values are read "
+                "as upper bounds on the evidence")
     add("")
     add("sensitivity to the bandwidth")
     add(sensitivity(df, cfg).to_string(index=False))
@@ -2747,7 +4192,8 @@ def _tex(md):
 
 
 def write_results(path_md, path_tex, df, raw, cfg, gaps, counts, disp, f_thesis,
-                  n_eff, corr, ladders, source, clus=None):
+                  n_eff, corr, ladders, source, clus=None, accounts=None,
+                  diag=None):
     """A results section with every number substituted, in markdown and in LaTeX.
 
     The point of generating the prose rather than typing it is that re-running after
@@ -2810,6 +4256,59 @@ def write_results(path_md, path_tex, df, raw, cfg, gaps, counts, disp, f_thesis,
     top_push = ", ".join(f"{k} {v:.2f}" for k, v in
                          sorted(push.items(), key=lambda kv: -kv[1])[:4])
 
+    # the account field: whether f is informative at all, and what it returns where
+    # the argument needs it. Written to say nothing when the layer was not computed.
+    field_txt = ""
+    if accounts is not None:
+        pr, tab = accounts["pred"], accounts["probes"]
+        fld = accounts["field"]
+
+        def probe_line(mask):
+            r = tab[mask]
+            if not len(r):
+                return None
+            r = r.iloc[0]
+            top = sorted(((c, r[c]) for c in ACCOUNTS if r[c] > 0.02),
+                         key=lambda kv: -kv[1])[:3]
+            return (r["probe"].replace("\n", " "),
+                    ", ".join(f"{c} {v:.2f}" for c, v in top),
+                    float(r["n_eff"]), float(r["entropy"]))
+
+        pieces = []
+        if np.isfinite(pr["logloss"]):
+            verdict_f = ("carries real information about the account"
+                         if pr["p"] < 0.05 else
+                         "cannot be distinguished from a field that returns the same "
+                         "distribution everywhere")
+            pieces.append(
+                f"Before reading anything off the field it is worth asking whether the "
+                f"design predicts the account at all. Leave-one-out over the {pr['n']} "
+                f"rows that carry one gives a log loss of {pr['logloss']:.2f} against "
+                f"{pr['logloss_null']:.2f} when the accounts are permuted across designs "
+                f"(p = {pr['p']:.3f}), and recovers the dominant account of "
+                f"{pr['accuracy']:.0%} of rows against {pr['accuracy_null']:.0%} by "
+                f"chance, so the map {verdict_f}.")
+        pieces.append(
+            f"Drawn over the ({', '.join(fld['plane'])}) plane, the field is owned rather "
+            f"than shared: mean normalised entropy {fld['entropy']:.2f} across the "
+            f"supported part of the plane, with {', '.join(fld['live'])} the accounts "
+            f"holding more than two per cent of it (`fig6b_account_field`). The pale "
+            f"regions of panel C are the honest ones — there the estimate rests on fewer "
+            f"than {ACCOUNT_MIN_NEFF:g} effective rows and should not be quoted.")
+        gap_rows = [probe_line(tab["probe"].str.startswith(k)) for k in
+                    ("frontier gap", "island gap")]
+        gap_rows = [g for g in gap_rows if g]
+        if gap_rows:
+            pieces.append(
+                "Read at the points the argument turns on (`fig6c_account_probes`): "
+                + "; ".join(f"{name} returns {top} on an effective {ne:.1f} rows "
+                            f"(H = {h:.2f})" for name, top, ne, h in gap_rows)
+                + ". A gap whose account distribution is thin and contested is a gap in "
+                  "theory as well as in paradigms; one that inherits a confident "
+                  "distribution from its neighbours is a design nobody has run because "
+                  "everyone already knows what it would show.")
+        field_txt = "\n\n".join(pieces)
+
     if clus is None:
         clus_txt = ("This run was made with clustering switched off; pass `-k 2` to "
                     "reproduce the check.")
@@ -2854,6 +4353,108 @@ def write_results(path_md, path_tex, df, raw, cfg, gaps, counts, disp, f_thesis,
               "partition that differs between groups on task difficulty but not on task "
               "relevance is telling you the corpus is organised by engagement rather than "
               "by what the event means, whatever the labels are called.")
+
+    # the diagnostics: written to make the weaker readings available rather than
+    # only the strong one, because every one of these tests can pass on noise
+    diag_txt = ""
+    if diag is not None:
+        pa, pdz = diag["permanova"], diag["permdisp"]
+        tab = diag["axis"]
+        carry = tab[tab["p"] < 0.05].sort_values("eta2", ascending=False)
+        flat = tab[tab["p"] >= 0.05]
+        jac = diag["jaccard"]
+        weak = [g for g, v in jac.items() if v < 0.6]
+        firm = [g for g, v in jac.items() if v >= 0.75]
+        st = diag["strength"]
+        ok_k = st[st["prediction_strength"] >= 0.8]["k"]
+        pieces = [
+            f"That the groups differ at all survives a test that does not assume "
+            f"normality, which the parametric alternative would need and these bounded "
+            f"lattice-valued coordinates would not satisfy: permutational MANOVA on the "
+            f"Euclidean distances gives pseudo-F = {pa['F']:.1f} "
+            + ("(p < 0.001)" if pa["p"] < 0.001 else f"(p = {pa['p']:.3f})")
+            + f" with $R^2$ = {pa['R2']:.2f}. "
+            + (f"Dispersion is also heterogeneous (PERMDISP pseudo-F = {pdz['F']:.1f}, "
+               + ("p < 0.001" if pdz["p"] < 0.001 else f"p = {pdz['p']:.3f}")
+               + "), so part of what separates the groups is how tightly each is packed "
+                 "rather than where its centre lies, and the location claim should be "
+                 "made no more strongly than the axis-by-axis result below supports."
+               if pdz["p"] < 0.05 else
+               f"Within-group dispersion is homogeneous (PERMDISP pseudo-F = "
+               f"{pdz['F']:.1f}, p = {pdz['p']:.3f}), so the separation is a difference "
+               f"in location rather than in spread."),
+            "The separation is not carried equally by the axes. "
+            + (", ".join(f"${a}$ ($\\eta^2$ = {e:.2f})" for a, e in
+                         zip(carry["axis"], carry["eta2"]))
+               + " reach significance against permuted labels"
+               if len(carry) else "No axis reaches significance against permuted labels")
+            + (", while " + ", ".join(f"${a}$ ($\\eta^2$ = {e:.2f}, p = {p:.2f})"
+                                      for a, e, p in
+                                      zip(flat["axis"], flat["eta2"], flat["p"]))
+               + " does not, which is the more interesting result: the corpus is "
+                 "organised by that axis no more than chance would organise it."
+               if len(flat) else "."),
+            "Stability is reported per cluster rather than as one number, because a "
+            "small cluster can dissolve entirely without moving the mean: "
+            + ", ".join(f"c{g} at {v:.2f}" for g, v in sorted(jac.items()))
+            + " on Hennig's bootstrap Jaccard"
+            + (f", so c{', c'.join(str(g) for g in firm)} "
+               f"{'is' if len(firm) == 1 else 'are'} stable on the usual reading"
+               if firm else "")
+            + (f" and c{', c'.join(str(g) for g in weak)} "
+               f"{'is' if len(weak) == 1 else 'are'} not."
+               if weak else ".")
+            + (f" Prediction strength on held-out halves supports k \u2264 {int(ok_k.max())} "
+               f"at the conventional cutoff of 0.8"
+               if len(ok_k) else " Prediction strength reaches the conventional cutoff "
+                                 "of 0.8 at no k in the sweep")
+            + (f", and the run was made at k = {clus['k']}." if clus else "."),
+        ]
+        sep = diag["separation"]
+        if sep is not None:
+            both = sep["p_gap"] < 0.05 and sep["p_bic"] < 0.05
+            either = sep["p_gap"] < 0.05 or sep["p_bic"] < 0.05
+            valley = ("the corpus is thinner between its two halves than a shapeless "
+                      "cloud of the same shape and size is between its own"
+                      if both else
+                      "one of the two statistics separates the corpus from the "
+                      "references and the other does not, which is weak evidence for "
+                      "a valley and should be reported as such" if either else
+                      "the corpus is no thinner between its two halves than an "
+                      "unclustered cloud of the same shape and size, so the valley "
+                      "does not survive the control")
+            comp = ""
+            if "composition" in sep:
+                parts = []
+                for j in (0, 1):
+                    c = {g: n for g, n in sep["composition"][f"h{j}"].items() if n}
+                    top = sorted(c.items(), key=lambda kv: -kv[1])[:2]
+                    parts.append(f"half {j} is {', '.join(f'{n} {g}' for g, n in top)}")
+                comp = (" The two halves are not the two hand labels either: "
+                        + "; ".join(parts) + ".")
+            pieces.append(
+                f"None of that yet tests the claim the chapter actually makes, which is "
+                f"not that a partition exists but that the corpus is *sparse between* "
+                f"the two literatures. The obvious test of that is circular, and the "
+                f"circularity is worth stating because the result looks convincing: pick "
+                f"the direction that best separates two clusters, project onto it, and "
+                f"the projection is bimodal by construction — a single Gaussian cloud put "
+                f"through those steps yields a clean valley and a decisive BIC. So the "
+                f"null here is a null over corpora rather than over projections. A "
+                f"unimodal reference with the covariance of the real corpus is drawn, "
+                f"split in two, given its own best direction and measured with its own "
+                f"valley, {sep['n_null']} times. Against that, the corpus's widest "
+                f"interior gap is {sep['gap']:.2f} sd against a reference mean of "
+                f"{sep['gap_null_mean']:.2f} (p = {sep['p_gap']:.3f}), and its "
+                f"two-component BIC margin is {sep['delta_bic']:.0f} against "
+                f"{sep['bic_null_mean']:.0f} (p = {sep['p_bic']:.3f}): "
+                + valley + "." + comp
+                + f" One caveat belongs with both numbers: the axes are ladders, so "
+                  f"{sep['tied_fraction']:.0%} of the projected values are tied, while "
+                  f"the references are continuous and have none. Ties manufacture empty "
+                  f"intervals, so each p-value is an upper bound on the evidence rather "
+                  f"than a lower one.")
+        diag_txt = "\n\n".join(pieces)
 
     md = f"""# The paradigm space: results
 
@@ -2928,11 +4529,15 @@ returns {acc} at the thesis paradigm (`fig6_accounts`). That estimate rests on a
 {n_eff:.1f} rows, which is the number to quote alongside it. Across the corpus as a whole the
 mass sits on {top_push}.
 
+{field_txt}
+
 ## Do the two literatures exist, or were they assumed?
 
 The cluster label on each row was assigned by the reviewer. Whether the corpus separates
 that way is a different question, and the geometry can answer it without being told the
 answer. {clus_txt}
+
+{diag_txt}
 
 ## What the representation costs
 
@@ -2988,6 +4593,7 @@ answer. {clus_txt}
     for name, (short, long) in CAPTIONS.items():
         text = long
         for k, v in dict(n=len(sub), disp=f"{disp:.2f}", records=len(raw),
+                         minneff=f"{ACCOUNT_MIN_NEFF:g}",
                          funnel="; ".join(f"{n}: {fun(n)}" for n in REGIONS)).items():
             text = text.replace("{" + k + "}", str(v))
         figs += [r"\begin{figure}[tbp]", r"  \centering",
@@ -3101,6 +4707,29 @@ CAPTIONS = {
         "A the $h$ layer as a block-structured heat map. B the pushforward $f_\\#\\mu$: which "
         "accounts the corpus actually spends its mass on. C $f$ evaluated at the thesis "
         "paradigm by kernel regression over the scored corpus, with the thesis rows held out."),
+    "fig6b_account_field": (
+        "The account field over the design space",
+        "The same kernel regression as figure 6, evaluated on a grid rather than at a "
+        "point, with the kernel conditioned on the two plotted coordinates alone so that "
+        "each panel is a marginal of the field rather than a slice through fixed values "
+        "of the remaining axes. A colour is the leading account and opacity its margin "
+        "over the runner-up; B the normalised entropy of $f$, low where one account owns "
+        "the design and high where several are live; C the effective number of rows "
+        "behind each cell, with the red contour at {minneff}. Pale cells in A and B fall "
+        "below that contour and are drawn as unsupported rather than as confident "
+        "answers. The lower panels are the individual accounts on the same plane, with "
+        "the rows carrying each as their dominant label. The dashed rectangle is the "
+        "shadow of $G_1$."),
+    "fig6c_account_probes": (
+        "The account field where the argument needs it",
+        "A $f$ read off at the centroid of each literature, at the candidate regions, at "
+        "the gaps of figure 5 and at the thesis paradigm, with the effective number of "
+        "rows and the normalised entropy above each bar. This is the account-space "
+        "version of the occupancy funnel: a gap whose distribution is thin and contested "
+        "is a gap in theory as well as in paradigms, whereas one that inherits a "
+        "confident distribution from its neighbours is a design nobody has run because "
+        "the answer is taken to be known. B and C restrict the $h$ layer to the hand "
+        "labels and to the partition the geometry found."),
     "fig7_audit": (
         "Audit of the scoring pass",
         "A what happened to each of the {records} records. B the confidence distribution over "
@@ -3115,6 +4744,22 @@ CAPTIONS = {
         "paradigm the label puts in one literature and the geometry puts in the other. D the "
         "contingency table with chance-corrected agreement. E what each discovered cluster "
         "is, read off the ladders."),
+    "fig9_separation": (
+        "Is the partition real, and is there a valley in it?",
+        "A the corpus split in two by itself and projected onto its own best "
+        "two-way direction, with the widest empty interval in the interior of that "
+        "projection shaded. A is not a test on its own: the direction was chosen to "
+        "make the split deep, so a single unclustered cloud put through the same "
+        "steps also yields a valley. B is what makes it one — the identical "
+        "procedure applied to unimodal references with the covariance of the corpus, "
+        "against which the observed gap is read. C permutational MANOVA against "
+        "permutational dispersion, so that a difference in location is not read off "
+        "a difference in spread. D variance explained per axis against permuted "
+        "labels; an axis that does not reach significance is one the corpus is not "
+        "organised by. E cluster-wise bootstrap Jaccard, which a mean co-assignment "
+        "score hides. F prediction strength on held-out halves, the one criterion in "
+        "the set with a conventional cutoff, drawn because the silhouette rises with "
+        "$k$ on a lattice and so cannot choose one."),
     "figA1_ladders": (
         "Occupancy of every rung of every ladder",
         "Bars are counts at the admissible values; ticks below each axis are individual "
@@ -3166,6 +4811,21 @@ def main(argv=None):
     ap.add_argument("--cluster-method", choices=["kmeans", "ward"], default="kmeans")
     ap.add_argument("--cluster-axes", default=None,
                     help="comma-separated axes to cluster on, e.g. x,y,z,t")
+    ap.add_argument("--no-diagnostics", dest="diagnostics", action="store_false",
+                    help="skip the permutation tests behind fig9 (they dominate runtime)")
+    ap.add_argument("--perm", type=int, default=999,
+                    help="permutations for permanova, permdisp and the axis effects")
+    ap.add_argument("--boot", type=int, default=100,
+                    help="bootstrap resamples for the per-cluster Jaccard stability")
+    ap.add_argument("--thesis", choices=["auto", "holdout", "include", "drop"],
+                    default="auto",
+                    help="auto: hold the thesis rows out of every estimate but draw "
+                         "them, if the workbook has any. holdout: force that. include: "
+                         "treat them as ordinary corpus rows. drop: discard them")
+    ap.add_argument("--account-plane", default="x,y",
+                    help="plane the account field is drawn on, e.g. x,t")
+    ap.add_argument("--account-perm", type=int, default=500,
+                    help="permutations for the account predictivity test (0 to skip)")
     ap.add_argument("--no-html", action="store_true")
     ap.add_argument("--no-pdf", action="store_true",
                     help="write report.tex but do not run pdflatex on it")
@@ -3186,33 +4846,78 @@ def main(argv=None):
     df.to_csv(out / "paradigm_scores.csv", index=False)
 
     use_style()
-    fig_space(df, ladders, out)
-    n_full = fig_projections(df, ladders, out)
-    counts = fig_regions(df, ladders, out)
-    fig_cube(df, ladders, out)
-    disp = fig_task_axes(df, ladders, out)
-    gaps, _ = gap_search(df, cfg)
-    fig_gaps(df, cfg, ladders, gaps, out)
-    thesis = df[df["thesis"]].dropna(subset=cfg.axes)
+    # How the thesis experiments are treated. They were designed after the formalism
+    # and to sit in one of its empty regions, so letting them into the density, the
+    # region counts or the clustering would let the analysis discover a gap that the
+    # thesis rows themselves had filled. Default is to detect them and hold them out
+    # of every estimate while still drawing them, so the same command works before
+    # they exist and after they are added.
+    n_thesis = int(df["thesis"].sum())
+    mode = args.thesis
+    if mode == "auto":
+        mode = "holdout" if n_thesis else "include"
+    if mode == "drop":
+        df = df[~df["thesis"]].reset_index(drop=True)
+        est, held = df, df.iloc[:0]
+    elif mode == "holdout":
+        est, held = df[~df["thesis"]].copy(), df[df["thesis"]].copy()
+    else:
+        est, held = df, df.iloc[:0]
+    over = held if len(held) else None
+    print(f"thesis rows: {n_thesis} ({mode})")
+
+    fig_space(est, ladders, out, cfg=cfg, overlay=over)
+    n_full = fig_projections(est, ladders, out, overlay=over, cfg=cfg)
+    counts = fig_regions(est, ladders, out, overlay=over)
+    fig_cube(est, ladders, out, overlay=over, cfg=cfg)
+    disp = fig_task_axes(est, ladders, out, overlay=over)
+    gaps, _ = gap_search(est, cfg)
+    fig_gaps(est, cfg, ladders, gaps, out, overlay=over)
+    thesis = held.dropna(subset=cfg.axes)
     point = thesis[cfg.axes].mean().to_numpy() if len(thesis) else centroid("G1", cfg.axes)
-    f_thesis, n_eff = fig_accounts(df, point, out)
-    corr = fig_audit(raw, df, out)
+    f_thesis, n_eff = fig_accounts(est, point, out)
+    corr = fig_audit(raw, est, out)
     clus = None
+    diag = None
     if args.clusters and args.clusters >= 2:
         cax = args.cluster_axes.split(",") if args.cluster_axes else cfg.axes
-        clus = cluster_corpus(df, cfg, k=args.clusters, method=args.cluster_method,
+        clus = cluster_corpus(est, cfg, k=args.clusters, method=args.cluster_method,
                               axes=[a.strip() for a in cax], 
                               out = out )
         fig_clusters(clus, ladders, out)
-    fig_ladders(df, ladders, out)
-    fig_year(df, ladders, out)
+        if args.diagnostics:
+            diag = cluster_diagnostics(clus, n_perm=args.perm, boot=args.boot)
+            fig_separation(clus, diag, ladders, out)
+            diag["axis"].to_csv(out / "cluster_axis_effects.csv", index=False)
+            diag["pairwise"].to_csv(out / "cluster_pairwise.csv", index=False)
+    # the account layer: the field over the space, then the field read off at the
+    # points the prose quotes. Both after the clustering, so panel C of fig6c can
+    # colour the partition the geometry found rather than the one assigned by hand.
+    aplane = tuple(a.strip() for a in args.account_plane.split(","))
+    acc_field = fig_account_field(est, ladders, gaps, out, plane=aplane, sigma=cfg.sigma)
+    acc_tab = fig_account_probes(est, cfg, gaps, out, clus=clus, sigma=cfg.sigma)
+    acc_pred = account_predictivity(est, axes=cfg.axes, sigma=cfg.sigma,
+                                    n_perm=args.account_perm)
+    acc_tab.to_csv(out / "account_probes.csv", index=False)
+    fig_ladders(est, ladders, out)
+    fig_year(est, ladders, out)
 
-    txt = report(df, raw, cfg, gaps, counts, disp, f_thesis, n_eff,
-                 corr, out / "scoring_report.txt", clus)
-    fragment = write_results(out / "results.md", out / "results.tex", df, raw, cfg, gaps,
+    acc = dict(field=acc_field, probes=acc_tab, pred=acc_pred)
+    txt = report(est, raw, cfg, gaps, counts, disp, f_thesis, n_eff,
+                 corr, out / "scoring_report.txt", clus, acc, diag, held)
+    fragment = write_results(out / "results.md", out / "results.tex", est, raw, cfg, gaps,
                              counts, disp, f_thesis, n_eff, corr, ladders, args.workbook,
-                             clus)
+                             clus, acc, diag)
     write_report(out / "report.tex", fragment, args.workbook)
+    write_captions(out / "captions.tex",
+                   dict(n=len(df.dropna(subset=PRINCIPAL)), disp=f"{disp:.2f}",
+                        records=len(raw), minneff=f"{ACCOUNT_MIN_NEFF:g}",
+                        funnel="; ".join(
+                            f"{n}: " + " → ".join(
+                                str(v) for _, v in
+                                funnel(df.dropna(subset=PRINCIPAL),
+                                       REGIONS[n]["constraints"]))
+                            for n in REGIONS)))
     if not args.no_pdf:
         pdf = compile_pdf(out / "report.tex")
         if pdf:
