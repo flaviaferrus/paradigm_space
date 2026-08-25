@@ -16,6 +16,24 @@ and run:
     python3 paradigm_space.py literature_database_scored_v5.xlsx -o figs_k3 -k 3
 where we can change the number of clusters and also the folder where to save it. 
 
+# In the call of the function we can also modify other parameters:
+#   --cluster-method ward: conducts the clustering with waed method instead of kmeans (default)
+#   --thesis include: includes the entries from the thesis 
+#       we can also select {auto,holdout,include,drop},
+#       default auto. It detects whether the workbook has thesis rows and, 
+#       if it does, holds them out of every estimate — density, region counts, 
+#       gap search, clustering, diagnostics, account field — while still drawing 
+#       them as purple stars. So the same command does the right thing before you 
+#       add them and after. 
+#       holdout forces it, include treats them as ordinary corpus, drop discards them entirely. 
+#   --axis x,y,z,t,s,x1,y1 determines the axes used for the clsutering
+#   --feasible applies the three structural constraints, restricting the gap search to
+#       the assumed feasible region (see figs_0824). OFF by default: the corpus was
+#       tested against those constraints and five published paradigms sit inside the
+#       region they call impossible (sperry1950neural, eliades2008neural,
+#       itti2009bayesian break y <= x + 1/3; landy2012dynamic, wolpert1995internal
+#       break x <= y + 1/2). See fig11_feasible and constraint_audit.csv.
+#       --no-feasible still works and is now a no-op restating the default.
 
 Written to <out>/:
     fig1_projections.pdf   the corpus in the six principal planes
@@ -43,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import textwrap
@@ -51,6 +70,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
 
 # ---------------------------------------------------------------------------
 # configuration
@@ -90,6 +110,11 @@ SIGMA = 0.09          # density bandwidth, reported not fitted
 SIGMA_REACH = 0.18    # nearest-neighbour scale of the reachability kernel
 EMPTY_DEFICIT = 0.95  # a cell counts as uncovered above this coverage deficit
 GRID = 13             # cells per axis in the 4D gap search
+# The structural constraints are OFF by default. They were on until the corpus was
+# tested against them: five published paradigms sit inside the region they call
+# impossible (constraint_audit, fig11_feasible). Set this to True, or pass --feasible,
+# if a revised set of constraints survives that test.
+USE_FEASIBLE = False
 
 CLUSTERS = {
     "motor":    dict(label="motor control", color="#157F7F"),
@@ -414,8 +439,21 @@ def reachability(u, points, sigma_r):
     return np.exp(-near / (2 * sigma_r ** 2)), np.sqrt(near), j
 
 
-def feasible(u, axes):
-    """The structural constraints of appendix A.1, evaluated on a grid."""
+def feasible(u, axes, enabled=None):
+    """The structural constraints of appendix A.1, evaluated on a grid.
+
+    These encode combinations of coordinates that no experiment can realise, not
+    combinations nobody has tried. A motor command cannot stay open to revision over a
+    long window when there is no motor task to revise, so y > x + 1/3 is impossible
+    rather than unexplored, and reporting it as a gap would be reporting an artefact of
+    the parametrisation. The constraints are a modelling assumption like any other and
+    are worth testing: USE_FEASIBLE (--no-feasible) turns them off, and the search then
+    runs on the whole cube, which is the honest way to see how much of the answer the
+    mask is responsible for.
+    """
+    u = np.atleast_2d(np.asarray(u, float))
+    if not (USE_FEASIBLE if enabled is None else enabled):
+        return np.ones(len(u), bool)
     idx = {a: i for i, a in enumerate(axes)}
     ok = np.ones(len(u), bool)
     if "x" in idx and "y" in idx:
@@ -466,6 +504,371 @@ def gap_search(df, cfg, k=2, separation=0.25):
             if len(chosen) == k:
                 break
     return pd.DataFrame(out), dict(cells=cells, deficit=deficit, reach=reach)
+
+
+# ---------------------------------------------------------------------------
+# 2b. empty space, measured geometrically
+# ---------------------------------------------------------------------------
+#
+# gap_search above answers "where is the smoothed density low, and is that place a
+# short walk from existing work". That is a statement about a kernel estimate, and it
+# inherits the kernel's bandwidth: a gap found at sigma = 0.09 is a gap at that scale.
+# It is already a joint calculation — the grid is the full 4D product and the kernel
+# uses the 4D distance — but nothing in its output tells the reader how large the hole
+# is, and a bandwidth-dependent point estimate is awkward to defend as a design
+# specification.
+#
+# The functions below take the other route: no kernel, no accounts, no smoothing. They
+# treat the corpus as a finite point set in the feasible part of the unit cube and ask
+# a purely geometric question — where are the largest regions containing no published
+# paradigm at all, and how large are they. A ball gives the depth of a hole in one
+# number; a box gives it as an interval per axis, which is what a design specification
+# actually looks like.
+#
+# The feasibility mask matters more here than anywhere else in the pipeline and is the
+# answer to the most common question about these maps. Large parts of the unit cube are
+# not under-studied but structurally impossible: a motor command cannot stay open to
+# revision over a long window when there is no motor task to revise, so everything with
+# y > x + 1/3 is excluded before any search runs. Low motor difficulty with a long motor
+# timescale is empty in the corpus, and correctly never reported as a gap.
+
+CONSTRAINTS = [
+    ("y <= x + 1/3", lambda P, i: P[:, i["y"]] <= P[:, i["x"]] + 1 / 3 + 1e-9,
+     "a command cannot stay open to revision with no motor task"),
+    ("x <= y + 1/2", lambda P, i: P[:, i["x"]] <= P[:, i["y"]] + 0.5 + 1e-9,
+     "a demanding task cannot be over before it starts"),
+    ("not (z < .05 and t > .05)",
+     lambda P, i: ~((P[:, i["z"]] < 0.05) & (P[:, i["t"]] > 0.05)),
+     "an event with no structure cannot define the task"),
+]
+
+
+def constraint_audit(df, axes):
+    """Test each structural constraint against the corpus that is supposed to obey it.
+
+    A constraint that claims impossibility is refutable, and the corpus is the thing
+    that refutes it: any published paradigm sitting in the excluded region is a design
+    the constraint says cannot exist. Run before trusting the mask, because an
+    unfalsified assumption and an untested one look identical in the output.
+    """
+    sub = df.dropna(subset=axes)
+    P = sub[axes].to_numpy(float)
+    i = {a: k for k, a in enumerate(axes)}
+    rows, offenders = [], {}
+    for name, test, why in CONSTRAINTS:
+        try:
+            ok = test(P, i)
+        except KeyError:
+            continue
+        bad = sub[~ok]
+        rows.append(dict(constraint=name, rationale=why, violations=int((~ok).sum()),
+                         share=float((~ok).mean())))
+        offenders[name] = bad
+    return pd.DataFrame(rows), offenders
+
+
+def _grid_cells(axes, grid, feasible_only=True):
+    lin = [np.linspace(0, 1, grid)] * len(axes)
+    cells = np.stack(np.meshgrid(*lin, indexing="ij"), -1).reshape(-1, len(axes))
+    return cells[feasible(cells, axes)] if feasible_only else cells
+
+
+def empty_balls(P, axes, k=4, grid=25, refine=3, min_sep=0.20):
+    """The largest empty balls in the feasible set: centre, radius, nearest paradigm.
+
+    The centre of the largest empty ball is the point of the design space furthest
+    from anything anyone has run — the deepest hole rather than the lowest smoothed
+    density — and its radius says how deep in the units of the axes themselves. Found
+    on a grid and then refined locally, which is enough at this resolution: the exact
+    solution is a vertex of the farthest-point Voronoi diagram, and in four dimensions
+    the exact construction buys nothing that a refined grid does not.
+
+    Successive balls are required to be `min_sep` apart so that the list describes
+    several holes rather than several points in the same one.
+    """
+    cells = _grid_cells(axes, grid)
+    tree = cKDTree(P)
+    d, _ = tree.query(cells, k=1)
+    out, chosen = [], []
+    step = 1.0 / (grid - 1)
+    for _ in range(k):
+        order = np.argsort(-d)
+        pick = None
+        for i in order:
+            u = cells[i]
+            if all(np.linalg.norm(u - c) >= min_sep for c in chosen):
+                pick = i
+                break
+        if pick is None:
+            break
+        u = cells[pick].copy()
+        r = d[pick]
+        # local refinement: walk the centre uphill on the distance-to-nearest field,
+        # halving the step, so the radius is not quantised to the grid
+        h = step / 2
+        for _ in range(refine):
+            improved = True
+            while improved:
+                improved = False
+                for j in range(len(axes)):
+                    for s in (+1, -1):
+                        v = u.copy()
+                        v[j] = np.clip(v[j] + s * h, 0, 1)
+                        if not feasible(v[None, :], axes)[0]:
+                            continue
+                        rv = np.sqrt(((v - P) ** 2).sum(1)).min()
+                        if rv > r + 1e-12:
+                            u, r, improved = v, rv, True
+            h /= 2
+        j = int(np.argmin(((u - P) ** 2).sum(1)))
+        chosen.append(u)
+        out.append(dict(radius=float(r), nearest=j,
+                        **{a: float(v) for a, v in zip(axes, u)}))
+        d = np.minimum(d, np.sqrt(((cells - u) ** 2).sum(1)))   # do not re-find it
+    return pd.DataFrame(out)
+
+
+def _box_feasible(lo, hi, axes, n=3):
+    grids = [np.linspace(l, h, n) for l, h in zip(lo, hi)]
+    pts = np.stack(np.meshgrid(*grids, indexing="ij"), -1).reshape(-1, len(axes))
+    return bool(feasible(pts, axes).all())
+
+
+def maximal_box(u, P, axes, step=0.02, margin=1e-6):
+    """Grow an axis-aligned empty box around u until nothing can grow further.
+
+    Reported alongside the ball because a radius is not a protocol. A box reads
+    directly as a specification — this range of motor difficulty, that range of task
+    relevance — and its per-axis widths say which coordinate the hole is actually wide
+    in, which a single radius cannot. Growth is greedy on volume and stops at the
+    first paradigm or the edge of the feasible set, so the result is maximal (no face
+    can move) though not necessarily maximum (no larger box exists elsewhere).
+    """
+    lo, hi = u.copy(), u.copy()
+
+    def empty(lo_, hi_):
+        return not np.all((P >= lo_ - margin) & (P <= hi_ + margin), axis=1).any()
+
+    grew = True
+    while grew:
+        grew = False
+        best = None
+        for j in range(len(axes)):
+            for s in (+1, -1):
+                lo2, hi2 = lo.copy(), hi.copy()
+                if s > 0:
+                    hi2[j] = min(hi2[j] + step, 1.0)
+                    if hi2[j] <= hi[j]:
+                        continue
+                else:
+                    lo2[j] = max(lo2[j] - step, 0.0)
+                    if lo2[j] >= lo[j]:
+                        continue
+                if not empty(lo2, hi2) or not _box_feasible(lo2, hi2, axes):
+                    continue
+                gain = np.prod(np.maximum(hi2 - lo2, 1e-9))
+                if best is None or gain > best[0]:
+                    best = (gain, lo2, hi2)
+        if best is not None:
+            _, lo, hi = best
+            grew = True
+    return lo, hi
+
+
+def empty_regions(df, cfg, k=4, grid=25, step=0.02, n_null=200, seed=0):
+    """Largest empty balls, their maximal boxes, and whether they are larger than chance.
+
+    The null answers the question a reviewer asks of any hole: 104 points scattered
+    at random in a four-dimensional feasible set leave holes too. Uniform samples of
+    the same size on the same feasible set are drawn, and the radius of the largest
+    empty ball is recorded for each, giving the distribution the observed radius is
+    read against.
+    """
+    axes = cfg.axes
+    P, w, sub = matrix(df, axes)
+    balls = empty_balls(P, axes, k=k, grid=grid)
+    rows = []
+    for _, b in balls.iterrows():
+        u = np.array([b[a] for a in axes])
+        lo, hi = maximal_box(u, P, axes, step=step)
+        r = dict(radius=b["radius"],
+                 **{a: float(v) for a, v in zip(axes, u)},
+                 volume=float(np.prod(hi - lo)),
+                 nearest=str(sub.iloc[int(b["nearest"])]["citekey"]
+                             or sub.iloc[int(b["nearest"])]["paradigm_id"]),
+                 **{f"{a}_lo": float(l) for a, l in zip(axes, lo)},
+                 **{f"{a}_hi": float(h) for a, h in zip(axes, hi)})
+        r["in_region"] = "+".join(
+            n for n, spec in REGIONS.items()
+            if all((u[axes.index(kk)] >= v) if op == ">=" else (u[axes.index(kk)] <= v)
+                   for kk, op, v in spec["constraints"])) or "—"
+        rows.append(r)
+    tab = pd.DataFrame(rows)
+
+    rng = np.random.default_rng(seed)
+    cells = _grid_cells(axes, grid)
+    null = []
+    obs0 = float(balls["radius"].max()) if len(balls) else float("nan")
+    if n_null <= 0:                       # comparison run: the table is all that is wanted
+        return dict(table=tab, null=np.array([]), radius=obs0, p=float("nan"),
+                    null_mean=float("nan"),
+                    feasible_fraction=float(feasible(
+                        _grid_cells(axes, grid, feasible_only=False), axes).mean()))
+    for _ in range(n_null):
+        idx = rng.choice(len(cells), len(P), replace=True)
+        Q = cells[idx] + rng.uniform(-0.5, 0.5, (len(P), len(axes))) / (grid - 1)
+        Q = np.clip(Q, 0, 1)
+        dn, _ = cKDTree(Q).query(cells, k=1)
+        null.append(float(dn.max()))
+    null = np.array(null)
+    obs = float(tab["radius"].max()) if len(tab) else float("nan")
+    return dict(table=tab, null=null, radius=obs,
+                p=float((null >= obs).sum() + 1) / (n_null + 1),
+                null_mean=float(null.mean()),
+                feasible_fraction=float(feasible(
+                    _grid_cells(axes, grid, feasible_only=False), axes).mean()))
+
+
+# ---------------------------------------------------------------------------
+# 2c. empty space, method 3: joint low-density regions
+# ---------------------------------------------------------------------------
+#
+# Methods 1 and 2 both return points, or a box grown around a point. Neither describes
+# the *shape* of an empty region, and neither uses the smoothed density jointly: method
+# 1 thresholds it cell by cell and then picks two extreme cells, method 2 ignores it
+# entirely and works from nearest-neighbour distance.
+#
+# This method takes the joint density as the object of interest. It evaluates rho(u)
+# over the full four-dimensional grid, keeps the cells below a quantile of it, and
+# groups those cells into connected components. A component is a low-density *region*
+# with a volume, a shape and a boundary, rather than a point; the largest box that
+# fits inside it is then reported so the region can still be read as a specification.
+#
+# The difference from method 2 is not joint versus sequential — method 2 is already
+# joint, its emptiness test being a conjunction over all four coordinates at once — but
+# smoothed versus exact, and region versus point. Method 2 asks how far a design can be
+# from any published paradigm. Method 3 asks how large a contiguous stretch of the space
+# the corpus leaves thinly covered. A hole can be deep and narrow (method 2 finds it,
+# method 3 may not resolve it) or shallow and vast (the reverse).
+
+def _neighbours(idx, shape):
+    for d in range(len(shape)):
+        for step in (-1, 1):
+            j = list(idx)
+            j[d] += step
+            if 0 <= j[d] < shape[d]:
+                yield tuple(j)
+
+
+def _components(mask):
+    """Connected components of a boolean grid, face-connectivity in n dimensions."""
+    lab = np.zeros(mask.shape, int)
+    cur = 0
+    for start in zip(*np.nonzero(mask)):
+        if lab[start]:
+            continue
+        cur += 1
+        stack = [start]
+        lab[start] = cur
+        while stack:
+            u = stack.pop()
+            for v in _neighbours(u, mask.shape):
+                if mask[v] and not lab[v]:
+                    lab[v] = cur
+                    stack.append(v)
+    return lab, cur
+
+
+def _inscribed_box(mask, seed):
+    """The largest axis-aligned box inside `mask` containing `seed`, grown greedily."""
+    lo = list(seed)
+    hi = list(seed)
+    grew = True
+    while grew:
+        grew = False
+        best = None
+        for d in range(mask.ndim):
+            for step in (-1, 1):
+                lo2, hi2 = lo.copy(), hi.copy()
+                if step > 0:
+                    if hi2[d] + 1 >= mask.shape[d]:
+                        continue
+                    hi2[d] += 1
+                else:
+                    if lo2[d] - 1 < 0:
+                        continue
+                    lo2[d] -= 1
+                sl = tuple(slice(a, b + 1) for a, b in zip(lo2, hi2))
+                if not mask[sl].all():
+                    continue
+                gain = np.prod([b - a + 1 for a, b in zip(lo2, hi2)])
+                if best is None or gain > best[0]:
+                    best = (gain, lo2, hi2)
+        if best is not None:
+            _, lo, hi = best
+            grew = True
+    return lo, hi
+
+
+def low_density_regions(df, cfg, grid=17, quantile=0.02, k=3, min_cells=3):
+    """Connected components of the joint low-density set, with an inscribed box each.
+
+    The threshold is a quantile of the density over the searchable set rather than an
+    absolute value, so the method reports the emptiest quarter of the space whatever
+    the corpus size, and the reader can move it. Components smaller than `min_cells`
+    are dropped as grid noise.
+    """
+    axes = cfg.axes
+    P, w, sub = matrix(df, axes)
+    lin = np.linspace(0, 1, grid)
+    dens = density(P, w, tuple(range(len(axes))), (lin,) * len(axes), cfg.sigma)
+    dens = dens / dens.max()
+    cells = np.stack(np.meshgrid(*([lin] * len(axes)), indexing="ij"), -1)
+    ok = feasible(cells.reshape(-1, len(axes)), axes).reshape(dens.shape)
+    thr = float(np.quantile(dens[ok], quantile))
+    low = (dens <= thr) & ok
+    lab, n = _components(low)
+    cell_vol = (1.0 / (grid - 1)) ** len(axes)
+    rows = []
+    for c in range(1, n + 1):
+        m = lab == c
+        size = int(m.sum())
+        if size < min_cells:
+            continue
+        pts = np.stack(np.nonzero(m), -1)
+        centre = cells[m].mean(0)
+        deep = tuple(pts[np.argmin(dens[m])])
+        lo_i, hi_i = _inscribed_box(m, deep)
+        lo = np.array([lin[i] for i in lo_i])
+        hi = np.array([lin[i] for i in hi_i])
+        inside = int(satisfies(sub, [(a, ">=", float(l)) for a, l in zip(axes, lo)]
+                               + [(a, "<=", float(h)) for a, h in zip(axes, hi)]).sum())
+        rows.append(dict(
+            component=c, cells=size, volume=size * cell_vol,
+            min_density=float(dens[m].min()), mean_density=float(dens[m].mean()),
+            occupancy=inside,
+            **{a: float(v) for a, v in zip(axes, centre)},
+            **{f"{a}_lo": float(l) for a, l in zip(axes, lo)},
+            **{f"{a}_hi": float(h) for a, h in zip(axes, hi)},
+            box_volume=float(np.prod(hi - lo))))
+    tab = pd.DataFrame(rows).sort_values("volume", ascending=False).head(k)
+
+    # how many distinct low-density regions there are is a function of the level, so
+    # the level is not left as an unexamined choice: the sweep below is reported with
+    # the result and drawn in the figure. Too high a quantile and the whole empty part
+    # of the cube is one component; too low and it fragments into grid noise.
+    sweep = []
+    for q in (0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.20):
+        t2 = float(np.quantile(dens[ok], q))
+        l2, n2 = _components((dens <= t2) & ok)
+        big = [int((l2 == c).sum()) for c in range(1, n2 + 1)]
+        sweep.append(dict(quantile=q, components=int(sum(b >= min_cells for b in big)),
+                          largest=max(big) if big else 0,
+                          cells=int(((dens <= t2) & ok).sum())))
+    return dict(table=tab.reset_index(drop=True), threshold=thr, grid=grid,
+                quantile=quantile, labels=lab, density=dens, lin=lin,
+                n_components=n, sweep=pd.DataFrame(sweep),
+                low_fraction=float(low.sum() / max(int(ok.sum()), 1)))
 
 
 def account_matrix(sub):
@@ -1393,7 +1796,7 @@ def centroid(name, axes=None):
 import matplotlib                                        # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt                          # noqa: E402
-from matplotlib.patches import Rectangle, Patch          # noqa: E402
+from matplotlib.patches import Circle, Rectangle, Patch          # noqa: E402
 from matplotlib.lines import Line2D                      # noqa: E402
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # noqa: E402
 
@@ -1629,25 +2032,78 @@ def fig_projections(df, ladders, out, overlay=None, cfg=None):
 
 # --- figure 2: the candidate regions, tested ------------------------------
 
-def fig_regions(df, ladders, out, overlay=None):
+def holes_as_regions(table, axes, k=2, floor=1e-6):
+    """Turn the discovered empty boxes into region specifications.
+
+    The two candidate regions are hypotheses written by hand from the mechanistic
+    question; these are their unsupervised counterparts, read off the geometry of the
+    corpus alone. Expressing them in the same form lets both go through the same
+    figure, the same funnel and the same occupancy count, so the comparison between a
+    region someone proposed and a region the data volunteered is like for like.
+
+    Only a bound sitting exactly on the edge of the cube is dropped, since that is the
+    one case where it constrains nothing. Dropping a bound merely because it is close
+    to the edge widens the region past where the box actually stops, and a box
+    advertised as empty then shows occupants in its own funnel.
+    """
+    out = {}
+    colours = ["#3B2E80", "#157F7F", "#8C6239", "#B0447A"]
+    for i, (_, row) in enumerate(table.head(k).iterrows()):
+        cons = []
+        for a in axes:
+            lo, hi = float(row[f"{a}_lo"]), float(row[f"{a}_hi"])
+            # round inward, never outward. Rounding a lower bound down or an upper
+            # bound up widens the box past where the growth stopped, which is exactly
+            # where the nearest paradigm sits: a box advertised as empty would then
+            # show occupants in its own funnel.
+            lo_r = math.ceil(lo * 100) / 100
+            hi_r = math.floor(hi * 100) / 100
+            if lo_r > floor:
+                cons.append((a, ">=", lo_r))
+            if hi_r < 1 - floor:
+                cons.append((a, "<=", hi_r))
+        if not cons:
+            continue
+        name = f"E{i + 1}"
+        out[name] = dict(
+            title=("largest empty box: "
+                   + ", ".join(f"{a} {'≥' if op == '>=' else '≤'} {v:g}"
+                               for a, op, v in cons)
+                   if i == 0 else
+                   "next empty box: "
+                   + ", ".join(f"{a} {'≥' if op == '>=' else '≤'} {v:g}"
+                               for a, op, v in cons)),
+            constraints=cons, color=colours[i % len(colours)],
+            radius=float(row["radius"]), volume=float(row["volume"]))
+    return out
+
+
+def fig_regions(df, ladders, out, overlay=None, regions=None, panels=None,
+                stem="fig2_regions"):
     """One row per region: two conditional planes and the constraint funnel.
 
     A panel shows only the paradigms that satisfy the constraints on the axes
     *not* drawn, so what is inside the box on screen is inside the region in
     the space. The funnel then reports the same thing as a count.
+
+    Parameterised over the set of regions so that the boxes the geometry discovers
+    can be put through exactly the same treatment as the two specified by hand.
+    Anything else would compare a region drawn one way against a region drawn
+    another, which is the comparison the figure exists to make fair.
     """
     sub = df.dropna(subset=PRINCIPAL)
-    panels = {"G1": [("x", "y"), ("x", "t")], "G2": [("x", "z"), ("z", "t")]}
-    names = list(REGIONS)
+    regions = REGIONS if regions is None else regions
+    panels = panels or {"G1": [("x", "y"), ("x", "t")], "G2": [("x", "z"), ("z", "t")]}
+    names = list(regions)
     fig = plt.figure(figsize=(3 * PANEL_W + 1.5, len(names) * PANEL_W + 1.2))
     gs = fig.add_gridspec(len(names), 3, width_ratios=[1, 1, 1.35],
                           wspace=0.45, hspace=0.62)
     counts = {}
     for i, name in enumerate(names):
-        spec = REGIONS[name]
+        spec = regions[name]
         members = satisfies(sub, spec["constraints"])
         counts[name] = int(members.sum())
-        for j, (a, b) in enumerate(panels[name]):
+        for j, (a, b) in enumerate(panels.get(name, [("x", "y"), ("x", "t")])):
             ax = fig.add_subplot(gs[i, j])
             (xlo, xhi), (ylo, yhi), off = rect_on_plane(spec["constraints"], a, b)
             live = satisfies(sub, off) if off else pd.Series(True, index=sub.index)
@@ -1698,7 +2154,7 @@ def fig_regions(df, ladders, out, overlay=None):
         ax.tick_params(axis="y", length=0)
     corpus_legend(fig, ncol=4, y=-0.06, context=True,
                   overlay=overlay is not None and len(overlay) > 0)
-    save(fig, out, "fig2_regions")
+    save(fig, out, stem)
     return counts
 
 
@@ -2340,6 +2796,158 @@ def _stack(ax, comp, live, labels):
     ax.set_ylabel("share of account mass")
 
 
+# --- figure 13: the discovered empty boxes in three dimensions --------------
+
+def fig_empty_boxes_3d(df, regions, ladders, out, cfg=None, overlay=None):
+    """The boxes of method 2, drawn in the idiom of figures 0 and 3.
+
+    A box on a plane is a shadow; a box in the cube is the region. Since the whole
+    point of these boxes is that a design inside them meets nothing published, they
+    are worth seeing as volumes with the corpus around them rather than as rectangles
+    a point can appear to fall into from the wrong angle.
+    """
+    if not regions:
+        return
+    sub = df.dropna(subset=PRINCIPAL)
+    sigma = getattr(cfg, "sigma", SIGMA) if cfg is not None else SIGMA
+    shade = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "wall", ["#FFFFFF", "#D6DEE3", "#93A6B0"])
+    names = list(regions)
+    fig = plt.figure(figsize=(3.75 * len(names), 3.9))
+    for i, name in enumerate(names):
+        spec = regions[name]
+        used = [a for a, _, _ in spec["constraints"]]
+        trio = [a for a in PRINCIPAL if a in used][:3]
+        while len(trio) < 3:
+            trio += [a for a in PRINCIPAL if a not in trio][:1]
+        a, b, c = trio
+        ax = fig.add_subplot(1, len(names), i + 1, projection="3d")
+        P = sub[[a, b, c]].to_numpy(float)
+        w = sub["w"].to_numpy(float)
+        lin = np.linspace(0, 1, 55)
+        for idx, zdir, offset in (((0, 1), "z", 0.0), ((0, 2), "y", 1.0),
+                                  ((1, 2), "x", 0.0)):
+            d = density(P, w, idx, (lin, lin), sigma)
+            d = d / d.max()
+            GA, GB = np.meshgrid(lin, lin, indexing="ij")
+            args = {"z": (GA, GB, d), "y": (GA, d, GB), "x": (d, GA, GB)}[zdir]
+            ax.contourf(*args, zdir=zdir, offset=offset,
+                        levels=np.linspace(0.04, 1, 9), cmap=shade, alpha=0.55,
+                        zorder=0, antialiased=True)
+        lo = {k: 0.0 for k in trio}
+        hi = {k: 1.0 for k in trio}
+        for k, op, v in spec["constraints"]:
+            if k not in trio:
+                continue
+            lo[k] = max(lo[k], v) if op == ">=" else lo[k]
+            hi[k] = min(hi[k], v) if op == "<=" else hi[k]
+        _box3d(ax, [(lo[a], hi[a]), (lo[b], hi[b]), (lo[c], hi[c])], spec["color"], 0.13)
+        inside = satisfies(sub, spec["constraints"]).to_numpy()
+        pa, pb = spread(sub[a].to_numpy(float), sub[b].to_numpy(float))
+        pc = sub[c].to_numpy(float)
+        colors = np.array([CLUSTERS[k]["color"] for k in sub["cluster"]])
+        ax.scatter(pa[~inside], pb[~inside], pc[~inside], s=15, c=colors[~inside],
+                   edgecolors="white", linewidths=0.3, alpha=0.92, depthshade=True,
+                   zorder=4)
+        if inside.any():
+            ax.scatter(pa[inside], pb[inside], pc[inside], s=20, c=colors[inside],
+                       edgecolors=INK, linewidths=0.8, depthshade=True, zorder=6)
+        if overlay is not None and len(overlay):
+            ov = overlay.dropna(subset=[a, b, c])
+            if len(ov):
+                oa, ob = spread(ov[a].to_numpy(float), ov[b].to_numpy(float))
+                ax.scatter(oa, ob, ov[c].to_numpy(float), s=42, marker="*",
+                           color=CLUSTERS["thesis"]["color"], edgecolors="white",
+                           linewidths=0.5, depthshade=False, zorder=7)
+        for k, nm in zip(trio, ("x", "y", "z")):
+            getattr(ax, f"set_{nm}lim")(0, 1)
+            getattr(ax, f"set_{nm}ticks")([0, 0.5, 1])
+            getattr(ax, f"set_{nm}ticklabels")(["0", ".5", "1"])
+        ax.set_xlabel(label_of(a, short=True), labelpad=-4)
+        ax.set_ylabel(label_of(b, short=True), labelpad=-4)
+        ax.set_zlabel(label_of(c, short=True), labelpad=-4)
+        ax.tick_params(pad=0.6, labelsize=6.0)
+        ax.set_box_aspect((1, 1, 1))
+        ax.view_init(elev=19, azim=-56)
+        off = [k for k, _, _ in spec["constraints"] if k not in trio]
+        ax.set_title(f"{'ABCD'[i]}  ({a}, {b}, {c})"
+                     + (f" — {', '.join(sorted(set(off)))} not shown" if off else ""),
+                     fontsize=7.2, loc="left", pad=-2)
+        for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+            pane.set_facecolor("white")
+            pane.set_edgecolor(RULE)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis._axinfo["grid"].update(color="#E7EBED", linewidth=0.5)
+    corpus_legend(fig, ncol=4, y=0.012, confidence=False,
+                  overlay=overlay is not None and len(overlay) > 0)
+    save(fig, out, "fig13_empty_boxes_3d")
+
+
+# --- figure 14: joint low-density regions ---------------------------------
+
+def fig_density_regions(df, cfg, res, ladders, out, planes=(("x", "y"), ("z", "t"))):
+    """Method 3: the emptiest part of the joint density, as connected regions.
+
+    Panel A is the honest part. How many distinct empty regions the corpus has is not
+    a fact but a function of the level at which the density is cut, so the level is
+    swept and the choice is shown rather than asserted.
+    """
+    tab, lab, lin = res["table"], res["labels"], res["lin"]
+    sub = df.dropna(subset=PRINCIPAL)
+    axes = cfg.axes
+    fig = plt.figure(figsize=(7.4, 4.4))
+    gs = fig.add_gridspec(1, 3, wspace=0.5, left=0.075, right=0.985, bottom=0.30,
+                          top=0.82)
+
+    # A -- how the component structure depends on the level
+    ax = fig.add_subplot(gs[0, 0])
+    sw = res["sweep"]
+    ax.plot(sw["quantile"], sw["components"], "-o", ms=3.4, lw=1.1, color=INK)
+    ax.axvline(res["quantile"], color="#C1425A", lw=1.0, ls="--")
+    ax.text(res["quantile"], ax.get_ylim()[1], " level used", fontsize=5.8,
+            color="#C1425A", va="top")
+    ax.set_xscale("log")
+    ax.set_xlabel("density quantile used as the level")
+    ax.set_ylabel("distinct low-density regions")
+    panel_title(ax, "A  the level is a choice, so it is swept", width=30,
+                sub="too high and the empty space is one region; too low and it "
+                    "fragments")
+
+    # B, C -- the components on two planes, with their inscribed boxes
+    colours = ["#4B2E83", "#157F7F", "#D2892A", "#B0447A"]
+    for j, (a, b) in enumerate(planes):
+        ax = fig.add_subplot(gs[0, j + 1])
+        ia, ib = axes.index(a), axes.index(b)
+        for n, (_, row) in enumerate(tab.iterrows()):
+            m = (lab == int(row["component"]))
+            # a component is four-dimensional; on a plane it is shown as the set of
+            # cells that project into it, which is a shadow and drawn faintly
+            proj = m.any(axis=tuple(k for k in range(len(axes)) if k not in (ia, ib)))
+            if ia > ib:
+                proj = proj.T
+            ax.contourf(lin, lin, proj.T.astype(float), levels=[0.5, 1.5],
+                        colors=[colours[n % 4]], alpha=0.13, zorder=0)
+            ax.add_patch(Rectangle(
+                (row[f"{a}_lo"], row[f"{b}_lo"]),
+                row[f"{a}_hi"] - row[f"{a}_lo"], row[f"{b}_hi"] - row[f"{b}_lo"],
+                facecolor="none", edgecolor=colours[n % 4], lw=1.2, ls="--", zorder=4))
+        square(ax, label_of(a, ladders, short=True), label_of(b, ladders, short=True))
+        scatter_corpus(ax, sub, a, b, size=11)
+        panel_title(ax, f"{'BC'[j]}  the regions on $({a}, {b})$", width=30,
+                    sub="shaded: the region's shadow · dashed: its inscribed box")
+
+    lines = []
+    for n, (_, row) in enumerate(tab.iterrows()):
+        lines.append(
+            f"region {n + 1}: {row['volume'] * 100:.1f}% of the searchable volume, "
+            f"{int(row['occupancy'])} paradigms inside its inscribed box "
+            + ", ".join(f"{a} [{row[f'{a}_lo']:.2f}, {row[f'{a}_hi']:.2f}]"
+                        for a in axes))
+    fig.text(0.075, 0.175, "\n".join(textwrap.wrap("  ·  ".join(lines), 118)),
+             fontsize=6.0, color="#42525B", va="top", linespacing=1.5)
+    save(fig, out, "fig14_density_regions")
+
+
 # --- figure 7: audit ------------------------------------------------------
 
 # Panel D used to print r in every cell. At eight axes the cells are ~11 pt wide,
@@ -2676,6 +3284,278 @@ def fig_separation(clus, diag, ladders, out):
     save(fig, out, "fig9_separation")
 
 
+def fig_feasible(df, cfg, empty, ladders, out):
+    """Does the corpus obey the constraints that are supposed to be inviolable?
+
+    The mask is the one part of the gap machinery that cannot be checked from its own
+    output: it decides what the search is allowed to see, so anything it excludes is
+    absent from every figure downstream and its exclusions look like emptiness. The
+    only external check available is the corpus itself, and it is a real check —
+    every published paradigm inside an excluded region is a counterexample to the claim
+    that the region cannot be occupied.
+    """
+    axes = cfg.axes
+    sub = df.dropna(subset=axes)
+    tab, offenders = constraint_audit(sub, axes)
+    fig = plt.figure(figsize=(7.4, 4.2))
+    gs = fig.add_gridspec(1, 3, wspace=0.46, left=0.07, right=0.985, bottom=0.34,
+                          top=0.84)
+
+    lin = np.linspace(0, 1, 200)
+    for col, (a, b) in enumerate((("x", "y"), ("z", "t"))):
+        ax = fig.add_subplot(gs[0, col])
+        GA, GB = np.meshgrid(lin, lin, indexing="ij")
+        U = np.full((GA.size, len(axes)), 0.5)
+        U[:, axes.index(a)], U[:, axes.index(b)] = GA.ravel(), GB.ravel()
+        ok = feasible(U, axes, enabled=True).reshape(GA.shape)
+        ax.contourf(lin, lin, (~ok).T.astype(float), levels=[0.5, 1.5],
+                    colors=["#F2DCE1"], zorder=0)
+        ax.contour(lin, lin, (~ok).T.astype(float), levels=[0.5], colors=["#C1425A"],
+                   linewidths=1.0, zorder=1)
+        square(ax, label_of(a, ladders, short=True), label_of(b, ladders, short=True))
+        scatter_corpus(ax, sub, a, b, size=13)
+        viol = pd.concat([v for k, v in offenders.items()
+                          if a in k.split() or b in k.split()] or
+                         [sub.iloc[:0]]).drop_duplicates(subset="paradigm_id")
+        viol = viol[~feasible(viol[axes].to_numpy(float), axes, enabled=True)]
+        if len(viol):
+            ax.scatter(viol[a], viol[b], s=110, facecolors="none",
+                       edgecolors="#C1425A", linewidths=1.4, zorder=7)
+            # violators can be coincident, so the labels are dealt out around the
+            # marker rather than all placed below and to the right of it
+            spots = [(9, 3), (9, -9), (-9, 6), (-9, -12), (9, 15)]
+            for n, (_, r) in enumerate(viol.iterrows()):
+                dx, dy = spots[n % len(spots)]
+                ax.annotate(str(r["citekey"])[:18], (r[a], r[b]), fontsize=5.4,
+                            color="#C1425A", xytext=(dx, dy),
+                            ha="left" if dx > 0 else "right",
+                            textcoords="offset points", zorder=8,
+                            annotation_clip=False)
+        panel_title(ax, f"{'AB'[col]}  the excluded region on ({a}, {b})", width=34,
+                    sub=(f"{len(viol)} published paradigm"
+                         f"{'' if len(viol) == 1 else 's'} inside it"))
+
+    # C -- what the mask decides about the answer
+    ax = fig.add_subplot(gs[0, 2])
+    if empty is not None:
+        masked = empty.get("masked_compare")
+        rows = [("constraints off", empty["table"].iloc[0] if len(empty["table"])
+                 else None, "#4B2E83")]
+        if masked is not None and len(masked["table"]):
+            rows.append(("constraints on", masked["table"].iloc[0], "#C1425A"))
+        for i, (name, r, col) in enumerate(rows):
+            if r is None:
+                continue
+            ax.barh([i], [r["radius"]], height=0.45, color=col, alpha=0.85)
+            ax.text(r["radius"] + 0.012, i,
+                    f"  r = {r['radius']:.2f}\n  ("
+                    + ", ".join(f"{r[a]:.2f}" for a in axes) + ")",
+                    va="center", fontsize=5.8, color=INK)
+        ax.set_yticks(range(len(rows)))
+        ax.set_yticklabels([n for n, _, _ in rows], fontsize=6.6)
+        ax.invert_yaxis()
+        ax.set_xlim(0, 1.25)
+        ax.set_xlabel("radius of the largest empty ball")
+    panel_title(ax, "C  what the mask decides", width=30,
+                sub="the deepest hole under each setting")
+
+    lines = ["  ".join(
+        f"{r['constraint']} — {r['violations']} violate it"
+        for _, r in tab.iterrows())] if len(tab) else []
+    fig.text(0.07, 0.18, "\n".join(textwrap.wrap(
+        "Each constraint claims that a combination of coordinates cannot be realised. "
+        "The corpus is the test of that claim, and it is a test the first two "
+        "constraints fail. " + (lines[0] if lines else ""), 112)),
+        fontsize=6.2, color="#42525B", va="top", linespacing=1.5)
+    save(fig, out, "fig11_feasible")
+    return tab
+
+
+# --- figure 10: empty space, measured geometrically -----------------------
+
+def fig_empty_space(df, cfg, res, ladders, out, plane=("x", "y")):
+    """Where the holes are, how big they are, and which part of the cube is off-limits.
+
+    Panel A is the one to look at first, because it answers the question this figure
+    is most often asked: several apparently empty corners of the design space are not
+    unexplored but impossible, and are excluded before any search runs.
+    """
+    axes = cfg.axes
+    P, w, sub = matrix(df, axes)
+    tab = res["table"]
+    a, b = plane
+    ia, ib = axes.index(a), axes.index(b)
+    fig = plt.figure(figsize=(7.4, 5.1))
+    gs = fig.add_gridspec(2, 12, height_ratios=[1, 0.78], hspace=0.52, wspace=2.7)
+
+    # A -- the feasible set
+    ax = fig.add_subplot(gs[0, 0:4])
+    lin = np.linspace(0, 1, 200)
+    GA, GB = np.meshgrid(lin, lin, indexing="ij")
+    U = np.zeros((GA.size, len(axes)))
+    U[:, ia], U[:, ib] = GA.ravel(), GB.ravel()
+    for j, k in enumerate(axes):
+        if j not in (ia, ib):
+            U[:, j] = 0.5
+    ok = feasible(U, axes).reshape(GA.shape)
+    ax.contourf(lin, lin, (~ok).T.astype(float), levels=[0.5, 1.5],
+                colors=["#E7EBED"], zorder=0)
+    ax.contour(lin, lin, (~ok).T.astype(float), levels=[0.5], colors=["#AEB8BC"],
+               linewidths=0.8, zorder=1)
+    square(ax, label_of(a, ladders, short=True), label_of(b, ladders, short=True))
+    scatter_corpus(ax, sub, a, b, size=10)
+    ax.text(0.16, 0.86, "structurally\nimpossible", fontsize=6.0, color="#6C7C85",
+            ha="center", va="center", zorder=4)
+    panel_title(ax, "A  what the search is allowed to look at", width=30,
+                sub=f"{res['feasible_fraction']:.0%} of the cube is feasible")
+
+    # B -- distance to the nearest published paradigm, through the deepest hole
+    ax = fig.add_subplot(gs[0, 4:8])
+    if len(tab):
+        centre = np.array([tab.iloc[0][k] for k in axes])
+        U2 = np.tile(centre, (GA.size, 1))
+        U2[:, ia], U2[:, ib] = GA.ravel(), GB.ravel()
+        D = np.sqrt(((U2[:, None, :] - P[None, :, :]) ** 2).sum(-1)).min(1)
+        D = np.where(feasible(U2, axes), D, np.nan).reshape(GA.shape)
+        cmap = matplotlib.colormaps["BuPu"].with_extremes(bad="#E7EBED")
+        im = ax.contourf(lin, lin, D.T, levels=12, cmap=cmap, zorder=0)
+        for i, r in tab.iterrows():
+            ax.add_patch(Circle((r[a], r[b]), r["radius"], facecolor="none",
+                                edgecolor="#C1425A", lw=1.0,
+                                ls="-" if i == 0 else (0, (2, 2)), zorder=4))
+            ax.scatter([r[a]], [r[b]], s=18, marker="+", color="#C1425A", zorder=5)
+        cb = fig.colorbar(im, ax=ax, fraction=0.036, pad=0.02, shrink=0.62,
+                          anchor=(0, 0))
+        cb.ax.set_title("distance", fontsize=5.8, color="#42525B", pad=3)
+        cb.ax.tick_params(labelsize=5.2)
+        cb.outline.set_linewidth(0.4)
+    square(ax, label_of(a, ladders, short=True), label_of(b, ladders, short=True))
+    scatter_corpus(ax, sub, a, b, size=10)
+    panel_title(ax, "B  distance to the nearest published paradigm", width=30,
+                sub="slice through the largest empty ball")
+
+    # C -- is the biggest hole bigger than chance leaves?
+    ax = fig.add_subplot(gs[0, 8:12])
+    ax.hist(res["null"], bins=20, color=GREY, alpha=0.75,
+            label=f"{len(res['null'])} uniform corpora\nof the same size")
+    ax.axvline(res["radius"], color="#C1425A", lw=1.3)
+    ax.text(res["radius"], ax.get_ylim()[1] * 0.98, " observed\n "
+            + ("$p$ < 0.01" if res["p"] < 0.01 else f"$p$ = {res['p']:.3f}"),
+            fontsize=6.0, color="#C1425A", ha="right", va="top")
+    ax.set_xlabel("radius of the largest empty ball")
+    ax.set_ylabel("draws")
+    ax.legend(fontsize=5.6, loc="upper left", frameon=False)
+    panel_title(ax, "C  bigger than random scatter leaves?", width=30)
+
+    # D -- the holes as design specifications
+    ax = fig.add_subplot(gs[1, :])
+    if len(tab):
+        n = len(tab)
+        colors = ["#4B2E83", "#C1425A", "#157F7F", "#D2892A"]
+        for j, k in enumerate(axes):
+            base = j * (n + 1.1)
+            for i, r in tab.iterrows():
+                y = base + i
+                ax.barh(y, r[f"{k}_hi"] - r[f"{k}_lo"], left=r[f"{k}_lo"], height=0.62,
+                        color=colors[i % 4], alpha=0.75, zorder=2)
+                ax.plot([r[k]], [y], marker="|", ms=7, color="white", zorder=3)
+            ax.text(-0.035, base + (n - 1) / 2, f"${k}$", fontsize=9, ha="right",
+                    va="center", color=INK)
+        ax.set_yticks([])
+        ax.set_xlim(-0.005, 1.005)
+        ax.set_ylim(-0.8, len(axes) * (n + 1.1) - 0.6)
+        ax.set_xlabel("rung")
+        ax.invert_yaxis()
+        for sp in ("left", "right", "top"):
+            ax.spines[sp].set_visible(False)
+        handles = [Patch(facecolor=colors[i % 4], alpha=0.75,
+                         label=f"hole {i + 1}: radius {r['radius']:.2f}, "
+                               f"box volume {r['volume']:.3f}"
+                               + (f", inside {r['in_region']}"
+                                  if r["in_region"] != "—" else ""))
+                   for i, r in tab.iterrows()]
+        ax.legend(handles=handles, fontsize=6.0, ncol=2, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.30), frameon=False)
+    panel_title(ax, "D  the same holes as maximal empty boxes: the range of each "
+                    "coordinate a design could take and still meet nothing published",
+                width=96, fontsize=7.6)
+    save(fig, out, "fig10_empty_space")
+
+
+# --- figure 8b: both partitions, and the gaps, on one plane ---------------
+
+def fig_partitions(clus, gaps, ladders, out, planes=(("x", "y"), ("x", "t")),
+                   overlay=None):
+    """The discovered clusters as territory, the assigned labels as points.
+
+    Figure 8 puts the two partitions in adjacent panels, which asks the reader to
+    hold one in memory while looking at the other. Here the clusters are drawn as
+    the region of the plane they occupy and the hand labels keep the points, so
+    disagreement is visible directly: a point of one colour inside another cluster's
+    territory is a paradigm the geometry and the reader classify differently. The
+    gaps are on the same axes, which is the only way to see whether a gap lies
+    between the clusters or beyond them.
+    """
+    sub, lab, given = clus["sub"], clus["labels"], clus["given"]
+    fig, axs = plt.subplots(1, len(planes),
+                            figsize=(len(planes) * PANEL_W + 1.6, PANEL_W + 1.05))
+    axs = np.atleast_1d(axs)
+    for ax, (a, b) in zip(axs, planes):
+        square(ax, label_of(a, ladders), label_of(b, ladders))
+        pts = sub[[a, b]].to_numpy(float)
+        for j in np.unique(lab):
+            m = lab == j
+            col = CLUSTER_PALETTE[j % 8]
+            hull_pts = pts[m]
+            if len(np.unique(hull_pts, axis=0)) >= 3:
+                try:
+                    from scipy.spatial import ConvexHull
+                    h = ConvexHull(hull_pts)
+                    poly = hull_pts[h.vertices]
+                    ax.fill(poly[:, 0], poly[:, 1], color=col, alpha=0.13, lw=0,
+                            zorder=1)
+                    ax.plot(np.append(poly[:, 0], poly[0, 0]),
+                            np.append(poly[:, 1], poly[0, 1]), color=col, lw=0.9,
+                            alpha=0.65, zorder=2)
+                except Exception:
+                    pass
+            c = hull_pts.mean(0)
+            ax.scatter([c[0]], [c[1]], s=70, marker="X", color=col, edgecolors=INK,
+                       linewidths=0.6, zorder=6)
+            ax.annotate(f"c{j}", (c[0], c[1]), fontsize=6.6, fontweight="bold",
+                        color=col, xytext=(5, 5), textcoords="offset points",
+                        annotation_clip=True, zorder=7)
+        scatter_corpus(ax, sub, a, b, size=16, zorder=4)
+        scatter_overlay(ax, overlay, a, b, size=40)
+        for _, g in gaps.iterrows():
+            marker = "o" if g["kind"] == "frontier" else "*"
+            ax.scatter(g[a], g[b], marker=marker, s=42 if marker == "o" else 90,
+                       facecolors="none" if marker == "o" else "#3B2E80",
+                       edgecolors="#3B2E80", linewidths=1.1, zorder=8)
+        ax.set_title(f"({a}, {b})", loc="left", fontsize=7.6)
+    handles = [Patch(facecolor=CLUSTER_PALETTE[j % 8], alpha=0.30,
+                     label=f"cluster c{j} ({int((lab == j).sum())})")
+               for j in np.unique(lab)]
+    present = set(sub["cluster"])
+    handles += [Line2D([], [], marker="o", ls="", color=s["color"],
+                       markeredgecolor="white", markersize=5, label=s["label"])
+                for k, s in CLUSTERS.items() if k in present]
+    if overlay is not None and len(overlay):
+        handles.append(Line2D([], [], marker="*", ls="",
+                              color=CLUSTERS["thesis"]["color"],
+                              markeredgecolor="white", markersize=8,
+                              label="thesis paradigms (held out)"))
+    handles += [Line2D([], [], marker="o", ls="", markerfacecolor="none",
+                       markeredgecolor="#3B2E80", markersize=5, label="frontier gap"),
+                Line2D([], [], marker="*", ls="", color="#3B2E80", markersize=8,
+                       label="island gap")]
+    fig.legend(handles=handles, loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.10),
+               fontsize=6.4, handletextpad=0.3, columnspacing=1.2)
+    fig.suptitle("shaded territory: the partition the geometry found  ·  point colour: "
+                 "the label assigned by hand", fontsize=7.6, y=1.005, color="#54646D")
+    save(fig, out, "fig8b_partitions")
+
+
 # --- appendix figures -----------------------------------------------------
 
 def fig_ladders(df, ladders, out):
@@ -2764,7 +3644,7 @@ def plotly_bundle():
             'charset="utf-8"></script>', False)
 
 
-def html_payload(df, ladders, cfg, gaps, raw, clus=None):
+def html_payload(df, ladders, cfg, gaps, raw, clus=None, holes=None):
     def num(v):
         return None if v is None or (isinstance(v, float) and not np.isfinite(v)) else round(float(v), 4)
 
@@ -2833,6 +3713,7 @@ def html_payload(df, ladders, cfg, gaps, raw, clus=None):
         "accountColor": ACCOUNT_COLOR,
         "accountMinNeff": ACCOUNT_MIN_NEFF,
         "gaps": gaps.to_dict("records"),
+        "holes": (holes.to_dict("records") if holes is not None else []),
         "audit": {"dispositions": [[k, int(v)] for k, v in disp],
                   "records": int(len(raw)),
                   "offLattice": [r["paradigm_id"] for _, r in
@@ -2951,24 +3832,26 @@ __PLOTLY__
   <p class="eyebrow">paradigm space · __NPARA__ scored paradigms · __NRECORDS__ records</p>
   <h1>Towards a formal literature review <br>
       <em>surprising events during ongoing motor control</em></h1>
-  <p class="sub">Every experimental design is a point: how much capacity the task commits,
-     how long the motor command stays open to revision, how deep a hierarchy the
-     perturbing event's statistics demand, and how much of the task the event carries.
-     One row of the workbook is one paradigm, so a paper running four experiments occupies
-     four points. Two literatures that rarely cite each other occupy opposite corners;
-     the argument of the thesis is about what lies between them.
+  <p class="sub">The motor control and environmental surprise literature have
+     developed through distinct and largely independent experimental traditions. 
+     Consequently, studies are often compared through verbal descriptions or 
+     theoretical labels rather than through an explicit characterization of their 
+     task structures. To make these comparisons more systematic, we develop a 
+     formal representation of the experimental paradigms reviewed in this thesis.
      <span class="coord">thesis paradigm · __THESISCOORD__</span></p>
-     <p><b>Clustering method:</b> {clustering_method}</p>
-    <p><b>Number of clusters:</b> {n_clusters}</p>
+     <p class="sub">__CLUSMETA__</p>
 </header>
 
 <section>
   <p class="eyebrow">step 1 — the coordinates</p>
-  <h2>Choose three axes and rotate</h2>
-  <p class="lead">Colour is cluster, marker is scoring confidence. Hover any point for the
-     reference, its coordinates and the note the score was justified with. The shaded volume
-     is the region set in step 2; the three axes on screen are the three you pick here, so a
-     constraint on a fourth axis is not carried and the box is drawn faint when that happens.</p>
+  <h2>Geometrical representation of the experimental paradigms</h2>
+  <p class="lead"> Every experimental design is a point in the low-dimensional space.
+       Among different axes, we can consider how much capacity the task commits (motor task difficulty),
+       how long the motor command stays open to revision (motor task timescale), how deep a hierarchy the
+       perturbing event's statistics demand (surprise hierarchy), and how much of the task the event carries 
+       (task relevance of the surprise).
+       One row of the workbook is one paradigm, so a paper running four experiments occupies
+       four points. </p>
   <div class="controls">
     <div class="ctl"><label>axis 1</label><select id="a1"></select></div>
     <div class="ctl"><label>axis 2</label><select id="a2"></select></div>
@@ -3021,8 +3904,40 @@ __PLOTLY__
   <p class="note" id="which"></p>
 </section>
 
+<section id="fitsec">
+  <p class="eyebrow">step 3 — the labels, checked against the geometry</p>
+  <h2>What the corpus splits into when nobody tells it the answer</h2>
+  <p class="lead">The cluster on every point so far is a label assigned by hand. This
+     section shows the partition <span class="coord" id="fitmeta"></span> found by
+     clustering the coordinates alone, with the labels hidden, so the two can be
+     compared point by point. Colour the same scatter both ways: where the two pictures
+     differ, the label and the geometry disagree about that paradigm. Use
+     <b>disagreements only</b>, or click a cell of the table, to list exactly which ones.</p>
+  <div class="controls">
+    <div class="ctl"><label>plane</label><select id="fplane"></select></div>
+    <div class="ctl"><label>hand label</label><select id="fgiven"></select></div>
+    <div class="ctl"><label>cluster found</label><select id="ffound"></select></div>
+    <div class="ctl"><label>show</label>
+      <button class="seg" id="fdis" aria-pressed="false">disagreements only</button></div>
+    <div class="readout">rows where the two agree<b id="fagree">—</b>
+      <span id="fstat"></span></div>
+  </div>
+  <div class="two">
+    <div><p class="eyebrow">coloured by the cluster the code found</p>
+      <div class="plot"><div id="ffoundplot" style="height:330px;width:100%"></div></div></div>
+    <div><p class="eyebrow">the same points, coloured by the hand label</p>
+      <div class="plot"><div id="fgivenplot" style="height:330px;width:100%"></div></div></div>
+  </div>
+  <div class="swatches" id="fswatch"></div>
+  <p class="eyebrow" style="margin-top:26px">where each hand label went</p>
+  <div class="plot"><div id="fflow" style="height:300px;width:100%"></div></div>
+  <table class="cross" id="fcross"></table>
+  <div id="flist" class="qlist"></div>
+  <p class="note" id="fnote"></p>
+</section>
+
 <section>
-  <p class="eyebrow">step 3 — emptiness as a low-density basin</p>
+  <p class="eyebrow">step 3b — emptiness as a low-density basin</p>
   <h2>The corpus as a field, not a scatter</h2>
   <p class="lead">Replace each paradigm by an isotropic Gaussian and the corpus becomes a
      density over the space; the coverage deficit is what is left of it. Because a marginal
@@ -3036,19 +3951,58 @@ __PLOTLY__
     <div class="ctl"><label>bandwidth σ = <span id="vs" class="coord"></span></label>
       <input type="range" id="bs" min="0.05" max="0.20" step="0.005" value="0.09"></div>
     <div class="ctl"><label>show</label>
-      <button class="seg" id="tgap" aria-pressed="true">gaps</button>
+      <button class="seg" id="tgap" aria-pressed="true">single-point gaps</button>
       <button class="seg" id="tpts" aria-pressed="true">paradigms</button></div>
+    <div class="ctl"><label>boxes</label>
+      <button class="seg" id="greg" aria-pressed="false">candidate regions</button>
+      <button class="seg" id="ghole" aria-pressed="false">empty boxes</button></div>
     <div class="readout">reachability of the box<b id="reach">—</b>
       <span id="reachnote"></span></div>
   </div>
   <div class="plot"><div id="dens" style="height:460px;width:100%"></div></div>
-  <p class="note">Reachability is measured from the centre of the box you set in step 2 to
-     the nearest published paradigm, so it answers a different question from the count:
-     not whether anyone has been there, but how far it is from somewhere they have.</p>
+  <p class="readout" style="margin-top:14px">largest empty ball<b id="gball">—</b>
+     <span id="gnote"></span></p>
+  <p class="note">The single markers are points: the cells of highest and lowest
+     reachability inside the uncovered set. The <b>boxes</b> are the wider claim.
+     <i>Candidate regions</i> are specified in advance from the mechanistic question;
+     <i>empty boxes</i> are found without them, by growing a box from the point furthest
+     from any published paradigm until it meets one. Every box drawn here is a shadow of
+     a four-dimensional region, so a point can fall inside it on screen while a
+     constraint on one of the two axes not shown puts it outside — which is why the
+     occupancy counts come from the funnel in step 2 and not from this picture.
+     Reachability is measured from the centre of that box to the nearest published
+     paradigm: not whether anyone has been there, but how far it is from somewhere they
+     have.</p>
 </section>
 
 <section>
-  <p class="eyebrow">step 4 — an empty region has to be empty in account space too</p>
+  <p class="eyebrow">step 4 — where the corpus is not</p>
+  <h2>The low-density regions, against the partition that found them</h2>
+  <p class="lead">A gap argument has to put two things side by side: the territory each
+     discovered cluster occupies, and the regions the corpus does not reach.
+     The empty regions themselves are drawn in step 3b, on the density they were found
+     from. The <b>single-point gaps</b> here are the cells of highest and lowest
+     reachability inside the uncovered set — a much narrower claim than a box, and off by
+     default for that reason.</p>
+  <div class="controls">
+    <div class="ctl"><label>plane</label><select id="gplane"></select></div>
+    <div class="ctl"><label>show</label>
+      <button class="seg" id="fgap" aria-pressed="false">single-point gaps</button></div>
+    <div class="ctl"><label>boxes</label>
+      <button class="seg" id="greg2" aria-pressed="false">candidate regions</button>
+      <button class="seg" id="ghole2" aria-pressed="false">empty boxes</button></div>
+    <div class="readout">clusters<b id="gcount">—</b>
+      <span id="gcnote"></span></div>
+  </div>
+  <div class="plot"><div id="fboth" style="height:460px;width:100%"></div></div>
+  <p class="note">A point inside another cluster's territory is a paradigm the geometry
+     and the reader classify differently. The hulls are drawn on the two axes shown, so
+     two clusters that separate on a third will overlap here: that is a fact about the
+     plane, not about the partition.</p>
+</section>
+
+<section>
+  <p class="eyebrow">step 5 — an empty region has to be empty in account space too</p>
   <h2>What the field would call the experiment you just specified</h2>
   <p class="lead">A region can be paper-empty and still map onto a well-covered part of
      theory, in which case filling it teaches nothing. The map f from a design to the
@@ -3065,7 +4019,7 @@ __PLOTLY__
 </section>
 
 <section>
-  <p class="eyebrow">step 4b — the same map, over the whole space</p>
+  <p class="eyebrow">step 5b — the same map, over the whole space</p>
   <h2>Which account owns which design</h2>
   <p class="lead">Evaluating f on a grid rather than at a point turns the account labels
      into a field over the space, and lets the emptiness of a region be checked in
@@ -3101,50 +4055,6 @@ __PLOTLY__
      gap between them is worth running.</p>
 </section>
 
-<section id="fitsec">
-  <p class="eyebrow">step 5 — the labels, checked against the geometry</p>
-  <h2>What the corpus splits into when nobody tells it the answer</h2>
-  <p class="lead">The cluster on every point so far is a label assigned by hand. This
-     section shows the partition <span class="coord" id="fitmeta"></span> found by
-     clustering the coordinates alone, with the labels hidden, so the two can be
-     compared point by point. Colour the same scatter both ways: where the two pictures
-     differ, the label and the geometry disagree about that paradigm. Use
-     <b>disagreements only</b>, or click a cell of the table, to list exactly which ones.</p>
-  <div class="controls">
-    <div class="ctl"><label>plane</label><select id="fplane"></select></div>
-    <div class="ctl"><label>hand label</label><select id="fgiven"></select></div>
-    <div class="ctl"><label>cluster found</label><select id="ffound"></select></div>
-    <div class="ctl"><label>show</label>
-      <button class="seg" id="fdis" aria-pressed="false">disagreements only</button></div>
-    <div class="readout">rows where the two agree<b id="fagree">—</b>
-      <span id="fstat"></span></div>
-  </div>
-  <div class="two">
-    <div><p class="eyebrow">coloured by the cluster the code found</p>
-      <div class="plot"><div id="ffoundplot" style="height:330px;width:100%"></div></div></div>
-    <div><p class="eyebrow">the same points, coloured by the hand label</p>
-      <div class="plot"><div id="fgivenplot" style="height:330px;width:100%"></div></div></div>
-  </div>
-  <div class="swatches" id="fswatch"></div>
-  <p class="eyebrow" style="margin-top:26px">where each hand label went</p>
-  <div class="plot"><div id="fflow" style="height:300px;width:100%"></div></div>
-  <table class="cross" id="fcross"></table>
-  <div id="flist" class="qlist"></div>
-  <p class="note" id="fnote"></p>
-</section>
-
-<section>
-  <p class="eyebrow">step 6 — what the corpus is and is not</p>
-  <h2>Audit</h2>
-  <table class="audit" id="audit"></table>
-  <div class="flag"><b>Read before quoting a number from this page</b>
-    Absence in a corpus is not absence in a literature: the smooth-pursuit and
-    saccadic-inhibition work delivers transient task-irrelevant events during ongoing
-    pursuit and is not yet in the database, so every statement here is a statement about
-    this corpus. Scores marked <span class="coord">lo</span> were inferred rather than read
-    from a Methods section — use the <span class="coord">drop lo</span> toggle before
-    quoting any coverage claim.</div>
-</section>
 
 <footer>Generated from <span class="coord">__SOURCE__</span> ·
   σ = <span id="fsig">0.09</span> · reachability scale __SIGR__ ·
@@ -3172,6 +4082,12 @@ const AGREE_LAB = {'agree':'label and geometry agree', 'disagree':'they disagree
                    'unclustered':'not clustered'};
 D.pts.forEach(p => { p.found = (FIT && FIT.found[p.id] !== undefined) ? FIT.found[p.id] : null; });
 state.fit = {plane:['x','t'], given:'all', found:'all', disagree:false};
+/* the gaps section has its own plane and its own overlays: it is a different question
+   from "do the two partitions agree", and sharing state made one control move both */
+state.gap = {plane:['x','t'], gaps:false};
+/* the box overlays belong to the density plot, which is where the empty regions were
+   found; the partitions plot shows the partition only */
+state.boxes = {regions:false, holes:false};
 state.acc = {plane:['x','y'], mode:'dominant', account:'SAL', pts:true, gaps:true};
 
 const el = id => document.getElementById(id);
@@ -3260,14 +4176,17 @@ function cubeTraces(){
         + `<br>label ${p.cluster}` + (FIT ? ` · found ${p.found===null?'—':'c'+p.found}` : '')
         + (p.note?`<br><i>${p.note}</i>`:'')),
       hovertemplate:'%{text}<extra></extra>',
-      marker:{ size:arr.map(p => (state.query && matches(p)) ? 11
-                                : inBox(p, state.box) ? 8 : 4.5),
-               opacity: 0.92,
+      // sized up: at 4.5px against a white cube with grid lines the corpus reads as
+      // dust rather than as points, and the ones inside the box need to stay
+      // distinguishable from it without becoming the only thing visible
+      marker:{ size:arr.map(p => (state.query && matches(p)) ? 14
+                                : inBox(p, state.box) ? 11 : 7.5),
+               opacity: 0.95,
                color: state.colorby === 'year' ? arr.map(p=>p.year) : colour,
                colorscale: state.colorby === 'year' ? 'Viridis' : undefined,
                showscale: state.colorby === 'year',
                symbol:arr.map(p=>SYM[p.conf]||'circle'),
-               line:{width:arr.map(p => (state.query && matches(p)) ? 2.4 : 0.5),
+               line:{width:arr.map(p => (state.query && matches(p)) ? 2.6 : 0.9),
                      color:arr.map(p => (state.query && matches(p)) ? '#101820' : 'white')} }
     });
   }
@@ -3375,6 +4294,51 @@ function findGaps(sigma){
   return [...pick([...empty].sort((a,b)=>b.reach-a.reach), 2).map(c=>({...c,kind:'frontier'})),
           ...pick([...empty].sort((a,b)=>a.reach-b.reach), 2).map(c=>({...c,kind:'island'}))];
 }
+function boxOnPlane(cons, a, b){
+  /* the projection of a 4D constraint box onto two of its axes, with the constraints
+     that fall off the plane returned so the caller can mark the rectangle a shadow */
+  const lo = {}, hi = {}, off = [];
+  PRIN.forEach(k => { lo[k] = 0; hi[k] = 1; });
+  cons.forEach(c => {
+    const k = c[0], op = c[1], v = c[2];
+    if (op === '>=') lo[k] = Math.max(lo[k], v); else hi[k] = Math.min(hi[k], v);
+    if (k !== a && k !== b) off.push(k);
+  });
+  return {x0:lo[a], x1:hi[a], y0:lo[b], y1:hi[b], off};
+}
+function boxShapes(a, b){
+  const shapes = [], anns = [];
+  if (state.boxes.regions){
+    Object.entries(D.regions || {}).forEach(([name, spec]) => {
+      const r = boxOnPlane(spec.constraints, a, b);
+      shapes.push({type:'rect', x0:r.x0, x1:r.x1, y0:r.y0, y1:r.y1,
+        line:{color:spec.color, width:1.6, dash:r.off.length ? 'dot' : 'solid'},
+        fillcolor:rgba(spec.color, 0.06), layer:'above'});
+      anns.push({x:r.x1, y:r.y1, text:name + (r.off.length ? ' shadow' : ''),
+        showarrow:false, xanchor:'right', yanchor:'bottom',
+        font:{size:10, color:spec.color},
+        bgcolor:'rgba(255,255,255,0.65)'});
+    });
+  }
+  if (state.boxes.holes){
+    (D.holes || []).forEach((h, i) => {
+      shapes.push({type:'rect', x0:h[a+'_lo'], x1:h[a+'_hi'],
+        y0:h[b+'_lo'], y1:h[b+'_hi'],
+        line:{color:'#1B2A33', width:1.2, dash:'dash'},
+        fillcolor:'rgba(27,42,51,0.04)', layer:'above'});
+      if (i === 0) anns.push({x:h[a+'_lo'], y:h[b+'_hi'], text:'largest empty box',
+        showarrow:false, xanchor:'left', yanchor:'bottom',
+        font:{size:10, color:'#1B2A33'}, bgcolor:'rgba(255,255,255,0.65)'});
+    });
+  }
+  const h0 = (D.holes || [])[0];
+  if (h0 && el('gball')){
+    el('gball').textContent = h0.radius.toFixed(2);
+    el('gnote').textContent = 'centre ' + PRIN.map(k => `${k} ${fmt(h0[k])}`).join(' · ')
+      + (h0.in_region && h0.in_region !== '—' ? ` · inside ${h0.in_region}` : '');
+  }
+  return {shapes, anns};
+}
 function drawDensity(){
   const [a,b] = state.plane, n = 70;
   const {lin, def} = marginal(a, b, n, state.sigma);
@@ -3402,7 +4366,9 @@ function drawDensity(){
                 color:'#3B2E80', line:{width:2, color:'#3B2E80'}}});
     });
   }
+  const bx = boxShapes(a, b);
   Plotly.react('dens', traces, {
+    shapes:bx.shapes, annotations:bx.anns,
     margin:{l:52,r:10,t:10,b:46}, paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'white',
     xaxis:{title:{text:D.axes[a].label, font:{size:12}}, range:[0,1], constrain:'domain'},
     yaxis:{title:{text:D.axes[b].label, font:{size:12}}, range:[0,1],
@@ -3750,10 +4716,92 @@ function drawCross(){
     refreshFit();
   });
 }
+/* Both partitions on one pair of axes: the discovered clusters as filled territory
+   (a convex hull of their members on this plane) and the hand labels as the point
+   colour, so a disagreement is a point sitting in the wrong territory rather than
+   something the reader has to find by comparing two pictures. */
+function hull(pts){
+  if (pts.length < 3) return pts;
+  const P = pts.slice().sort((a,b) => a[0]-b[0] || a[1]-b[1]);
+  const cross = (o,a,b) => (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0]);
+  const lower = [];
+  for (const p of P){
+    while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = P.length-1; i >= 0; i--){
+    const p = P[i];
+    while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  lower.pop(); upper.pop();
+  return lower.concat(upper);
+}
+function drawBoth(){
+  if (!FIT) return;
+  const [a,b] = state.gap.plane;
+  const P = fitPts().filter(p => p[a] !== null && p[b] !== null);
+  const traces = [];
+  const founds = [...new Set(P.map(p => p.found))].sort((x,y) => x-y);
+  founds.forEach(f => {
+    const pts = P.filter(p => p.found === f).map(p => [p[a], p[b]]);
+    const h = hull(pts);
+    if (h.length >= 3){
+      traces.push({type:'scatter', mode:'lines', fill:'toself', hoverinfo:'skip',
+        x:h.concat([h[0]]).map(v=>v[0]), y:h.concat([h[0]]).map(v=>v[1]),
+        fillcolor:rgba(cpal(f), 0.13), line:{color:cpal(f), width:1.2},
+        name:`cluster c${f} (${pts.length})`, legendgroup:'c'+f});
+    }
+    const cx = pts.reduce((s,v)=>s+v[0],0)/pts.length;
+    const cy = pts.reduce((s,v)=>s+v[1],0)/pts.length;
+    traces.push({type:'scatter', mode:'markers+text', x:[cx], y:[cy], text:[`c${f}`],
+      textposition:'top right', textfont:{size:11, color:cpal(f)}, hoverinfo:'skip',
+      showlegend:false, legendgroup:'c'+f,
+      marker:{symbol:'x', size:13, color:cpal(f), line:{width:1, color:'#1B2A33'}}});
+  });
+  const s = spread(P, a, b, a, 0.012);
+  Object.entries(D.clusters).forEach(([k, v]) => {
+    const idx = P.map((p,i) => p.cluster === k ? i : -1).filter(i => i >= 0);
+    if (!idx.length) return;
+    traces.push({type:'scatter', mode:'markers', name:v.label,
+      x:idx.map(i=>s[i].x), y:idx.map(i=>s[i].y),
+      text:idx.map(i=>`<b>${P[i].key}</b><br>${P[i].title}`
+        + `<br>hand label ${P[i].cluster} · found c${P[i].found}`),
+      hovertemplate:'%{text}<extra></extra>',
+      marker:{size:7, color:v.color, line:{width:0.8, color:'white'}}});
+  });
+  if (state.gap.gaps){
+    ['frontier','island'].forEach(kind => {
+      const g = D.gaps.filter(v => v.kind === kind);
+      if (!g.length) return;
+      traces.push({type:'scatter', mode:'markers', name:kind+' gap',
+        x:g.map(v=>v[a]), y:g.map(v=>v[b]),
+        text:g.map(v=>`${kind} gap<br>`+PRIN.map(k=>`${k} ${fmt(v[k])}`).join(' · ')),
+        hovertemplate:'%{text}<extra></extra>',
+        marker:{symbol: kind==='frontier'?'circle-open':'star',
+                size: kind==='frontier'?14:16, color:'#3B2E80',
+                line:{width:2, color:'#3B2E80'}}});
+    });
+  }
+  const bx = boxShapes(a, b);
+  el('gcount').textContent = founds.length;
+  el('gcnote').textContent = founds.map(f =>
+    `c${f} ${P.filter(p => p.found === f).length}`).join(' · ');
+  Plotly.react('fboth', traces, {
+    shapes:bx.shapes, annotations:bx.anns,
+    margin:{l:54,r:12,t:10,b:48}, paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'white',
+    xaxis:{title:{text:D.axes[a].label, font:{size:12}}, range:[-0.05,1.05], constrain:'domain'},
+    yaxis:{title:{text:D.axes[b].label, font:{size:12}}, range:[-0.05,1.05],
+           scaleanchor:'x', scaleratio:1},
+    legend:{orientation:'h', y:1.08, x:0, font:{size:10}}
+  }, {displayModeBar:false, responsive:true});
+}
 function refreshFit(){
   if (!FIT) return;
   fitScatter('ffoundplot', p => cpal(p.found));
   fitScatter('fgivenplot', p => COL[p.cluster] || '#8A9AA2');
+  drawBoth();
   drawFlow();
   drawCross();
 
@@ -3812,6 +4860,19 @@ function buildFitControls(){
     el('fdis').setAttribute('aria-pressed', state.fit.disagree);
     refreshFit();
   };
+  const gplanes = [];
+  for (let i=0;i<PRIN.length;i++) for (let j=i+1;j<PRIN.length;j++)
+    gplanes.push([PRIN[i], PRIN[j]]);
+  el('gplane').innerHTML = gplanes.map(([a,b]) =>
+    `<option value="${a},${b}">${a} vs ${b}</option>`).join('');
+  el('gplane').value = state.gap.plane.join(',');
+  el('gplane').onchange = () => {
+    state.gap.plane = el('gplane').value.split(','); drawBoth(); };
+  el('fgap').onclick = () => {
+    state.gap.gaps = !state.gap.gaps;
+    el('fgap').setAttribute('aria-pressed', state.gap.gaps);
+    drawBoth();
+  };
   el('fswatch').innerHTML = FIT.foundNames.map((n,i) =>
       `<span class="s"><span class="dot" style="background:${cpal(i)}"></span>${n}`
       + `${FIT.mapping[i] ? ' → ' + FIT.mapping[i] : ''}</span>`).join('')
@@ -3864,6 +4925,21 @@ function buildControls(){
   };
   toggle('tlo','dropLo', () => { refreshBox(); drawDensity(); });
   toggle('tth','hideThesis', () => { refreshBox(); drawDensity(); });
+  /* the box overlays are one piece of state with two sets of buttons, so turning
+     them on in either section turns them on in both and the two plots cannot end up
+     showing different regions */
+  [['greg','ghole'], ['greg2','ghole2']].forEach(ids => {
+    ids.forEach((id, n) => {
+      const key = n === 0 ? 'regions' : 'holes';
+      el(id).onclick = () => {
+        state.boxes[key] = !state.boxes[key];
+        [['greg','greg2'],['ghole','ghole2']][n].forEach(other =>
+          el(other) && el(other).setAttribute('aria-pressed', state.boxes[key]));
+        drawDensity();
+        drawBoth();
+      };
+    });
+  });
   el('tgap').onclick = () => { state.showGaps = !state.showGaps;
     el('tgap').setAttribute('aria-pressed', state.showGaps); drawDensity(); };
   el('tpts').onclick = () => { state.showPts = !state.showPts;
@@ -3895,13 +4971,6 @@ function buildControls(){
     drawCube();
   };
   q.addEventListener('input', runSearch);
-
-  const rows = D.audit.dispositions.map(([k,v]) =>
-    `<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('');
-  el('audit').innerHTML = '<tr><th>disposition</th><th>records</th></tr>' + rows
-    + `<tr><td>scored on all four principal axes</td><td class="num">${full().length}</td></tr>`
-    + `<tr><td>scores off the rung lattice (rule R7)</td>`
-    + `<td class="num">${D.audit.offLattice.length}</td></tr>`;
 }
 buildControls();
 buildFitControls();
@@ -3916,12 +4985,13 @@ refreshFit();
 """
 
 
-def write_html(path, df, ladders, cfg, gaps, raw, source, inline=None, clus=None):
+def write_html(path, df, ladders, cfg, gaps, raw, source, inline=None,
+               clus=None, holes=None):
     js, offline = plotly_bundle()
     if inline is False:
         js, offline = ('<script src="https://cdn.plot.ly/plotly-3.0.0.min.js" '
                        'charset="utf-8"></script>', False)
-    payload = html_payload(df, ladders, cfg, gaps, raw, clus)
+    payload = html_payload(df, ladders, cfg, gaps, raw, clus, holes)
     thesis = df[df["thesis"]]
     coord = " · ".join(
         f"{a} {thesis[a].mean():.2f}" for a in PRINCIPAL
@@ -3932,6 +5002,10 @@ def write_html(path, df, ladders, cfg, gaps, raw, source, inline=None, clus=None
             .replace("__NPARA__", str(len(df)))
             .replace("__NRECORDS__", str(len(raw)))
             .replace("__THESISCOORD__", coord)
+            .replace("__CLUSMETA__",
+                     f"clustering: {clus['method']}, k = {clus['k']}, on "
+                     + ", ".join(clus["axes"]) if clus else
+                     "clustering: not run for this page (pass -k)")
             .replace("__SOURCE__", Path(source).name)
             .replace("__SIGR__", f"{cfg.sigma_reach:g}")
             .replace("__WHI__", f"{WEIGHT['hi']:g}")
@@ -3961,7 +5035,7 @@ def sensitivity(df, cfg, sigmas=(0.06, 0.09, 0.12, 0.15)):
 
 
 def report(df, raw, cfg, gaps, counts, mean_disp, f_thesis, n_eff, corr, path,
-           clus=None, acc=None, diag=None, held=None):
+           clus=None, acc=None, diag=None, held=None, empty=None):
     sub = df.dropna(subset=PRINCIPAL)
     P, w, pub = matrix(df[~df["thesis"]], cfg.axes)
     lines = []
@@ -4011,10 +5085,72 @@ def report(df, raw, cfg, gaps, counts, mean_disp, f_thesis, n_eff, corr, path,
             add(f"    {pid:<18} reach {r_:.3f} at {d_:.3f} "
                 f"from {pub.iloc[k]['paradigm_id']}")
     add("")
-    add("gaps (searched in 4D, separately among the uncovered cells)")
+    add("gaps, method 1: low smoothed density (kernel, sigma = "
+        f"{cfg.sigma:g}), searched over the feasible 4D grid")
+    add("  a cell qualifies when its coverage deficit is at least "
+        f"{EMPTY_DEFICIT:g} and no paradigm lies inside it;")
+    add("  frontier and island gaps are the qualifying cells of highest and lowest")
+    add("  reachability, taken separately because the arg max of deficit alone is")
+    add("  always the far corner of the cube")
     for _, g in gaps.iterrows():
         add(f"  {g['kind']:<9} ({', '.join(f'{g[a]:.2f}' for a in cfg.axes)})"
             f"  reach {g['reach']:.3f}")
+    if empty is not None:
+        tab = empty["table"]
+        add("")
+        add("gaps, method 2: largest empty regions of the joint space (no kernel)")
+        add("  the corpus is treated as a point set in the searchable part of the unit")
+        add("  cube; the largest empty ball is the point furthest from any published")
+        add("  paradigm, and its maximal box is grown from that centre until it meets")
+        add("  a paradigm or the edge of the searchable set")
+        if USE_FEASIBLE:
+            add(f"  structural constraints ON: {empty['feasible_fraction']:.2f} of the "
+                "cube is searchable;")
+            add("  the rest is treated as impossible rather than unexplored and is "
+                "never")
+            add("  reported as a gap — but see the constraint audit below before "
+                "relying on that")
+        else:
+            add("  structural constraints OFF (the default): the whole cube is "
+                "searched, so")
+            add("  a hole reported here may be a design that cannot be run")
+        add(f"  largest empty ball radius {empty['radius']:.3f} against "
+            f"{empty['null_mean']:.3f} for uniform corpora of the same size "
+            f"(p = {empty['p']:.4f})")
+        um = empty.get("masked_compare")
+        if um is not None and len(um["table"]):
+            u0 = um["table"].iloc[0]
+            other = "on" if not USE_FEASIBLE else "off"
+            add(f"  with the structural constraints {other} the largest hole instead has")
+            add(f"    radius {u0['radius']:.3f} at ("
+                + ", ".join(f"{u0[a]:.2f}" for a in cfg.axes) + ")")
+        lowd = empty.get("lowd")
+        if lowd is not None and len(lowd["table"]):
+            add("")
+            add("gaps, method 3: connected regions of the joint low-density set")
+            add("  the joint density is evaluated over the full 4D grid, cut at the "
+                f"{lowd['quantile']:.1%} quantile,")
+            add("  and the surviving cells are grouped into connected components; the "
+                "largest box")
+            add("  fitting inside each component is reported so the region still reads "
+                "as a design")
+            add(f"  {lowd['n_components']} components at this level "
+                f"(the level itself is swept in fig14)")
+            for n, (_, rr) in enumerate(lowd["table"].iterrows()):
+                add(f"  region {n + 1}: {rr['volume'] * 100:.1f}% of the searchable "
+                    f"volume, {int(rr['cells'])} cells, "
+                    f"{int(rr['occupancy'])} paradigms in its box")
+                add("      box: " + ", ".join(
+                    f"{a} [{rr[f'{a}_lo']:.2f}, {rr[f'{a}_hi']:.2f}]"
+                    for a in cfg.axes))
+        for i, r in tab.iterrows():
+            add(f"  hole {i + 1}: centre ("
+                + ", ".join(f"{r[a]:.2f}" for a in cfg.axes)
+                + f")  radius {r['radius']:.2f}  box volume {r['volume']:.3f}"
+                + f"  region {r['in_region']}")
+            add("      box: " + ", ".join(
+                f"{a} [{r[f'{a}_lo']:.2f}, {r[f'{a}_hi']:.2f}]" for a in cfg.axes)
+                + f"   nearest {r['nearest']}")
     if acc is not None:
         add("")
         add("account space")
@@ -4071,6 +5207,18 @@ def report(df, raw, cfg, gaps, counts, mean_disp, f_thesis, n_eff, corr, path,
         for n in REGIONS:
             k = int(satisfies(sub_h, REGIONS[n]["constraints"]).sum())
             add(f"  {n}: {counts[n]} published, {k} thesis")
+    ctab, _ = constraint_audit(df, cfg.axes)
+    if len(ctab):
+        add("")
+        add("constraint audit: does the corpus obey the structural constraints?")
+        add("  a published paradigm inside an excluded region is a counterexample to "
+            "the")
+        add("  claim that the region cannot be occupied")
+        n_scored = len(df.dropna(subset=cfg.axes))
+        for _, c in ctab.iterrows():
+            verdict = "holds" if c["violations"] == 0 else "FAILS"
+            add(f"  {c['constraint']:<26} {verdict:<6} {c['violations']} of "
+                f"{n_scored} violate it   ({c['rationale']})")
     add("")
     add(f"mean motor → non-motor displacement {mean_disp:.2f}")
     add("axis collinearity above 0.5:")
@@ -4744,6 +5892,61 @@ CAPTIONS = {
         "paradigm the label puts in one literature and the geometry puts in the other. D the "
         "contingency table with chance-corrected agreement. E what each discovered cluster "
         "is, read off the ladders."),
+    "fig10_empty_space": (
+        "Empty space, measured geometrically",
+        "A the searchable set. When the structural constraints are on, the shaded "
+        "wedges are excluded before any search runs; they are off by default because "
+        "five published paradigms fall inside them (figure 11). B distance from each point of the plane "
+        "to the nearest published paradigm, on the slice through the centre of the "
+        "largest empty ball, with the recovered balls drawn as circles; because the "
+        "slice passes through the centre these are the true cross-sections. C the "
+        "radius of the largest empty ball against uniform corpora of the same size on "
+        "the same feasible set. D the same holes as maximal empty boxes: the range "
+        "each coordinate may take while the design still meets nothing published."),
+    "fig12_empty_boxes": (
+        "The regions the geometry proposes, drawn like the regions specified by hand",
+        "The two largest empty boxes of the corpus, put through the same figure as the "
+        "candidate regions of figure 2: two conditional planes and the constraint "
+        "funnel, with each panel showing only the paradigms that satisfy the "
+        "constraints on the axes not drawn. The funnel is the check that matters — a "
+        "box found by growing from the point furthest from any published paradigm "
+        "until it meets one should reach zero occupancy on its own count, and does. "
+        "Unlike $G_1$ and $G_2$ these regions were not proposed from the mechanistic "
+        "question; they are what the arrangement of the corpus volunteers on its own."),
+    "fig13_empty_boxes_3d": (
+        "The discovered empty boxes as volumes",
+        "The boxes of figure 12 drawn in the idiom of figures 0 and 3: the walls carry "
+        "the marginal density of the pair they span, and the box is the region rather "
+        "than its shadow. Where a box is constrained on a fourth axis that cannot be "
+        "drawn, the title says so, and points appearing inside the volume may be "
+        "excluded by that constraint."),
+    "fig14_density_regions": (
+        "Method 3: the emptiest part of the joint density, as connected regions",
+        "Rather than a point or a box grown around one, this method cuts the joint "
+        "four-dimensional density at a level and groups the surviving cells into "
+        "connected components, so an empty region acquires a volume and a shape. A the "
+        "number of distinct regions is a function of the level, not a fact about the "
+        "corpus, so the level is swept and the choice shown. B and C the components "
+        "projected onto two planes, shaded, with the largest box that fits inside each "
+        "drawn dashed. The shading is a shadow: a cell is drawn if any part of the "
+        "region projects into it."),
+    "fig11_feasible": (
+        "Do the structural constraints survive contact with the corpus?",
+        "The mask that decides which parts of the design space the gap search may look "
+        "at cannot be checked from its own output, since anything it excludes is absent "
+        "from every figure downstream and its exclusions look like emptiness. The "
+        "corpus is the one external check available, and it is a real one: every "
+        "published paradigm inside an excluded region is a counterexample to the claim "
+        "that the region cannot be occupied. A and B show the excluded regions with the "
+        "violating paradigms circled; C shows the deepest hole in the space under each "
+        "setting of the mask."),
+    "fig8b_partitions": (
+        "Both partitions, and the gaps, on one pair of axes",
+        "Shaded territory is the convex hull of each cluster the geometry found on "
+        "this plane; point colour is the label assigned by hand. A point inside "
+        "another cluster's territory is a paradigm the two disagree about. The gaps "
+        "are drawn on the same axes, which is the only way to see whether an empty "
+        "region lies between the clusters or beyond them."),
     "fig9_separation": (
         "Is the partition real, and is there a valley in it?",
         "A the corpus split in two by itself and projected onto its own best "
@@ -4817,6 +6020,27 @@ def main(argv=None):
                     help="permutations for permanova, permdisp and the axis effects")
     ap.add_argument("--boot", type=int, default=100,
                     help="bootstrap resamples for the per-cluster Jaccard stability")
+    ap.add_argument("--feasible", dest="feasible", action="store_true", default=False,
+                    help="apply the structural constraints in CONSTRAINTS, excluding "
+                         "those parts of the cube from the gap search. Off by default: "
+                         "the current constraints are contradicted by five paradigms in "
+                         "the corpus (fig11_feasible)")
+    ap.add_argument("--no-feasible", dest="feasible", action="store_false",
+                    help="explicitly search the whole cube (now the default)")
+    ap.add_argument("--low-quantile", type=float, default=0.02,
+                    help="density quantile used as the level for method 3")
+    ap.add_argument("--low-grid", type=int, default=17,
+                    help="cells per axis for the joint low-density grid (method 3)")
+    ap.add_argument("--low-regions", type=int, default=3,
+                    help="how many low-density regions to report from method 3")
+    ap.add_argument("--box-regions", type=int, default=2,
+                    help="how many discovered empty boxes to draw as regions in fig12")
+    ap.add_argument("--holes", type=int, default=4,
+                    help="how many maximal empty balls to report")
+    ap.add_argument("--hole-grid", type=int, default=25,
+                    help="cells per axis for the geometric empty-region search")
+    ap.add_argument("--hole-null", type=int, default=200,
+                    help="uniform reference corpora for the largest-hole test")
     ap.add_argument("--thesis", choices=["auto", "holdout", "include", "drop"],
                     default="auto",
                     help="auto: hold the thesis rows out of every estimate but draw "
@@ -4833,6 +6057,8 @@ def main(argv=None):
                     help="load plotly from the CDN instead of inlining it")
     args = ap.parse_args(argv)
 
+    global USE_FEASIBLE
+    USE_FEASIBLE = args.feasible
     cfg = Config(sigma=args.sigma, sigma_reach=args.sigma_reach, grid=args.grid,
                  drop_lo=args.drop_lo, per_event=args.per_event)
     out = Path(args.out)
@@ -4873,6 +6099,50 @@ def main(argv=None):
     disp = fig_task_axes(est, ladders, out, overlay=over)
     gaps, _ = gap_search(est, cfg)
     fig_gaps(est, cfg, ladders, gaps, out, overlay=over)
+    # the same question asked without a kernel: where are the largest regions of the
+    # feasible set containing nothing at all, and how large are they
+    empty = empty_regions(est, cfg, k=args.holes, grid=args.hole_grid,
+                          n_null=args.hole_null)
+    # the same search with the constraints off, so the report can say how much of the
+    # answer the mask is responsible for rather than asking the reader to take it on
+    # trust. Skipped when the constraints are already off, since it would be identical.
+    # the same search under the opposite setting of the mask, so the report can say how
+    # much of the answer the constraints are responsible for rather than asking the
+    # reader to take it on trust
+    empty["masked_compare"] = None
+    flip = not USE_FEASIBLE
+    USE_FEASIBLE = flip
+    try:
+        empty["masked_compare"] = empty_regions(est, cfg, k=args.holes,
+                                                grid=args.hole_grid, n_null=0)
+    finally:
+        USE_FEASIBLE = not flip
+    caudit = fig_feasible(est, cfg, empty, ladders, out)
+    caudit.to_csv(out / "constraint_audit.csv", index=False)
+    # the discovered boxes, drawn and counted exactly like the hand-specified regions
+    ereg = holes_as_regions(empty["table"], cfg.axes, k=args.box_regions)
+    if ereg:
+        epanels = {}
+        for nm, spec in ereg.items():
+            used = [a for a, _, _ in spec["constraints"]]
+            pair = [a for a in cfg.axes if a in used][:2] or ["x", "y"]
+            rest = [a for a in cfg.axes if a not in pair]
+            epanels[nm] = [(pair[0], pair[1]),
+                           (pair[0], rest[-1] if rest else pair[1])]
+        ecounts = fig_regions(est, ladders, out, overlay=over, regions=ereg,
+                              panels=epanels, stem="fig12_empty_boxes")
+        fig_empty_boxes_3d(est, ereg, ladders, out, cfg=cfg, overlay=over)
+        empty["regions"] = ereg
+        empty["counts"] = ecounts
+    # method 3: the joint density cut at a level, grouped into connected regions
+    lowd = low_density_regions(est, cfg, grid=args.low_grid,
+                               quantile=args.low_quantile, k=args.low_regions)
+    if len(lowd["table"]):
+        fig_density_regions(est, cfg, lowd, ladders, out)
+        lowd["table"].to_csv(out / "low_density_regions.csv", index=False)
+    empty["lowd"] = lowd
+    fig_empty_space(est, cfg, empty, ladders, out)
+    empty["table"].to_csv(out / "empty_regions.csv", index=False)
     thesis = held.dropna(subset=cfg.axes)
     point = thesis[cfg.axes].mean().to_numpy() if len(thesis) else centroid("G1", cfg.axes)
     f_thesis, n_eff = fig_accounts(est, point, out)
@@ -4885,6 +6155,7 @@ def main(argv=None):
                               axes=[a.strip() for a in cax], 
                               out = out )
         fig_clusters(clus, ladders, out)
+        fig_partitions(clus, gaps, ladders, out, overlay=over)
         if args.diagnostics:
             diag = cluster_diagnostics(clus, n_perm=args.perm, boot=args.boot)
             fig_separation(clus, diag, ladders, out)
@@ -4904,7 +6175,7 @@ def main(argv=None):
 
     acc = dict(field=acc_field, probes=acc_tab, pred=acc_pred)
     txt = report(est, raw, cfg, gaps, counts, disp, f_thesis, n_eff,
-                 corr, out / "scoring_report.txt", clus, acc, diag, held)
+                 corr, out / "scoring_report.txt", clus, acc, diag, held, empty)
     fragment = write_results(out / "results.md", out / "results.tex", est, raw, cfg, gaps,
                              counts, disp, f_thesis, n_eff, corr, ladders, args.workbook,
                              clus, acc, diag)
@@ -4926,8 +6197,7 @@ def main(argv=None):
     if not args.no_html:
         offline = write_html(out / "paradigm_space.html", df, ladders, cfg, gaps, raw,
                              args.workbook, inline=False if args.cdn else None,
-                             clus=clus 
-                             )#method=args.cluster_method, n_clusters=args.clusters)
+                             clus=clus, holes=empty["table"])
         note = "plotly inlined, works offline" if offline else "plotly loaded from the CDN"
         print(f"paradigm_space.html written ({note})")
 
