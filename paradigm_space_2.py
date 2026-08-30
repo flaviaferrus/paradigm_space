@@ -242,6 +242,8 @@ class Config:
     grid: int = GRID
     drop_lo: bool = False
     per_event: bool = False
+    paper_weight: bool = False
+    corrections: str = ""
     axes: list = field(default_factory=lambda: list(PRINCIPAL))
 
 
@@ -391,11 +393,70 @@ def load_corpus(xlsx, cfg: Config, sheet="Articles"):
     out["thesis"] = thesis
     out["confidence"] = out["confidence"].fillna("lo")
     out["w"] = out["confidence"].map(WEIGHT).fillna(WEIGHT["lo"])
+
+    # A rescoring layer that leaves the workbook alone. Every change lives in one
+    # small csv (paradigm_id, axis, value, reason) that travels with the analysis,
+    # so a claim that turns on a re-read paper can be checked against the file that
+    # changed it rather than against an undated edit in a spreadsheet cell.
+    if cfg.corrections:
+        out = apply_corrections(out, cfg.corrections)
+
+    # The unit of independent evidence. A paper reporting twelve experiments that
+    # differ on a factor the axes do not carry contributes twelve identical points,
+    # and davis1939electrical does exactly that: ten of its twelve sit on
+    # (0, 0, ~0.33, 0), 9% of the corpus at one coordinate. Left alone it inflates
+    # the density of the passive corner, drags the low-motor cluster's centroid and
+    # decides where the largest empty ball is not. Dividing the confidence weight by
+    # the number of paradigms the paper contributes keeps every experiment visible as
+    # a point while giving each paper one paper's worth of weight.
+    # citekeys carry the experiment as a suffix: davis1939electrical_e1 .. _e12,
+    # capozio_effect_2021_e1 .. _e5 and the stray capozio_effect_2021e_6
+    out["paper"] = (out["citekey"].where(out["citekey"].astype(bool),
+                                         "row" + out["row"].astype(str))
+                    .str.replace(r"(_e\d+|e_\d+)$", "", regex=True))
+    out["n_exp"] = out.groupby("paper")["paper"].transform("size")
+    out["w_row"] = out["w"]
+    if cfg.paper_weight:
+        out["w"] = out["w"] / out["n_exp"]
+
     if cfg.drop_lo:
         out = out[out["confidence"] != "lo"].copy()
 
     out["off_lattice"] = _off_lattice(out)
     return out.reset_index(drop=True)
+
+
+def apply_corrections(out, path):
+    """Auditable rescoring: a csv of (paradigm_id, axis, value, reason).
+
+    Kept out of the workbook on purpose. A gap that appears only after three rows
+    are re-read is a fact about those three rows, and the reader is entitled to see
+    them listed rather than to diff two versions of a spreadsheet.
+    """
+    p = Path(path)
+    if not p.exists():
+        print(f"corrections file not found: {p}")
+        return out
+    fix = pd.read_csv(p)
+    need = {"paradigm_id", "axis", "value"}
+    if not need <= set(fix.columns):
+        raise SystemExit(f"corrections csv needs columns {sorted(need)}")
+    key = out["citekey"].where(out["citekey"].astype(bool),
+                               "row" + out["row"].astype(str))
+    applied = 0
+    for _, r in fix.iterrows():
+        m = key == str(r["paradigm_id"]).strip()
+        if not m.any():
+            print(f"  correction skipped, no such paradigm: {r['paradigm_id']}")
+            continue
+        a = str(r["axis"]).strip()
+        if a not in out.columns:
+            print(f"  correction skipped, no such axis: {a}")
+            continue
+        out.loc[m, a] = float(r["value"])
+        applied += int(m.sum())
+    print(f"corrections applied: {applied} cell(s) from {p.name}")
+    return out
 
 
 def _expand_events(df, out):
@@ -509,8 +570,7 @@ def feasible(u, axes, enabled=None):
     idx = {a: i for i, a in enumerate(axes)}
     ok = np.ones(len(u), bool)
     if "x" in idx and "y" in idx:
-        ok &= u[:, idx["y"]] <= u[:, idx["x"]] + 1 / 3 + 1e-9
-        ok &= u[:, idx["x"]] <= u[:, idx["y"]] + 0.5 + 1e-9
+        ok &= u[:, idx["y"]] >= y_floor(u[:, idx["x"]])
     if "z" in idx and "t" in idx:
         ok &= ~((u[:, idx["z"]] < 0.05) & (u[:, idx["t"]] > 0.05))
     return ok
@@ -584,14 +644,57 @@ def gap_search(df, cfg, k=2, separation=0.25):
 # y > x + 1/3 is excluded before any search runs. Low motor difficulty with a long motor
 # timescale is empty in the corpus, and correctly never reported as a gap.
 
+# The x rungs entail a minimum y rung, and this is readable straight off the two
+# ladders rather than asserted as a slope. x = 0.33 is "one discrete response", which
+# is at least one command, so y >= 0.14. x = 0.67 names reaching and sustained grip,
+# a movement long enough for feedback to revise it in flight, so y >= 0.29. x = 0.83
+# is "closed loop with a moving goal", which is a goal held open across the trial, so
+# y >= 0.43. Below x = 0.33 the ladder allows a task with no measured effector output,
+# so nothing is entailed. Linear interpolation between the rungs, so the envelope is
+# defined off-lattice too. Two rows fail it (wolpert1995internal, landy2012dynamic)
+# and both are flagged in their own scoring notes as off-ladder judgement calls.
+X_RUNGS = np.array([0.00, 0.17, 0.33, 0.50, 0.67, 0.83, 1.00])
+Y_FLOOR = np.array([0.00, 0.00, 0.14, 0.14, 0.29, 0.43, 0.43])
+
+
+def y_floor(x):
+    return np.interp(np.asarray(x, float), X_RUNGS, Y_FLOOR) - 1e-9
+
+
 CONSTRAINTS = [
-    ("y <= x + 1/3", lambda P, i: P[:, i["y"]] <= P[:, i["x"]] + 1 / 3 + 1e-9,
-     "a command cannot stay open to revision with no motor task"),
-    ("x <= y + 1/2", lambda P, i: P[:, i["x"]] <= P[:, i["y"]] + 0.5 + 1e-9,
-     "a demanding task cannot be over before it starts"),
+    ("y >= floor(x)", lambda P, i: P[:, i["y"]] >= y_floor(P[:, i["x"]]),
+     "output that must be held implies a command open long enough to hold it"),
     ("not (z < .05 and t > .05)",
      lambda P, i: ~((P[:, i["z"]] < 0.05) & (P[:, i["t"]] > 0.05)),
      "an event with no structure cannot define the task"),
+]
+
+# Both of the original slope constraints are retired. They are still audited, so the
+# report says what happened to them rather than silently dropping them.
+#
+#   x <= y + 1/2   false as stated. A ballistic reach to a small target under a
+#                  deadline is maximally demanding and closed at onset, which is
+#                  exactly the corner it excluded. It was also inert: the largest
+#                  empty ball sits at (1,1,1,0) with r = 0.769 with or without it.
+#                  It cost two audit failures for nothing. The envelope above keeps
+#                  the part of it that is true (x = 0.67 needs a held command)
+#                  without the part that is not.
+#
+#   y <= x + 1/3   contradicted by the ladders, not only by the corpus. The y = 1.0
+#                  rung reads "self-paced behaviour over minutes with no trial
+#                  structure: free viewing, locomotion, free behaviour"; the x = 0
+#                  rung reads "no instruction to act". The same three paradigms
+#                  satisfy both by construction, so the constraint denies a cell its
+#                  own ladders define. Demand does not bound timescale: free viewing
+#                  is zero-demand and maximal-timescale. Retiring it leaves the
+#                  (x=0, y=1) corner in the search, which is the honest outcome —
+#                  it is genuinely empty, it is simply not the thesis's gap, and
+#                  combination_gaps() is what distinguishes the two.
+CONSTRAINTS_RETIRED = [
+    ("y <= x + 1/3", lambda P, i: P[:, i["y"]] <= P[:, i["x"]] + 1 / 3 + 1e-9,
+     "retired: contradicted by the y=1.0 and x=0 rungs themselves"),
+    ("x <= y + 1/2", lambda P, i: P[:, i["x"]] <= P[:, i["y"]] + 0.5 + 1e-9,
+     "retired: false for ballistic precision tasks, and inert"),
 ]
 
 
@@ -607,7 +710,7 @@ def constraint_audit(df, axes):
     P = sub[axes].to_numpy(float)
     i = {a: k for k, a in enumerate(axes)}
     rows, offenders = [], {}
-    for name, test, why in CONSTRAINTS:
+    for name, test, why in list(CONSTRAINTS) + list(CONSTRAINTS_RETIRED):
         try:
             ok = test(P, i)
         except KeyError:
@@ -998,6 +1101,283 @@ def gap_intersection(df, cfg, lowd, empty, depth_frac=0.6, quantile=0.20, k=2,
                 share_deep=float(deep.sum() / searchable),
                 share_both=float(both.sum() / searchable),
                 overlap=float(both.sum() / max(int(large.sum()), 1)))
+
+
+def combination_gaps(df, cfg, k=4, grid=21, sigma=None, min_clearance=0.30,
+                     separation=0.35, n_perm=200, seed=0, axes=None, mask=True):
+    """Unexplored *combinations* of individually well-explored values.
+
+    Methods 1-3 all measure how far a point is from the corpus, and in a unit
+    4-cube that question has a fixed answer: the corners. They are far from
+    everything by construction, whether or not an experiment could be run there,
+    which is why the whole result previously turned on the feasibility mask. It is
+    also not identifiable at this corpus size. The two leading corners here are
+    (0,1,1,0) at clearance 0.795 and (1,1,1,0) at 0.769 — a 3% margin set by one
+    paper on each side (bufacchi2017approaching and zink2016mobile_e3). Rescoring
+    either one flips which region the chapter reports.
+
+    This function asks the question the review actually poses. A gap in a
+    literature is not a coordinate nobody can reach; it is a *conjunction* nobody
+    has tried, assembled from values that each tradition uses routinely. Compare
+    the joint density f(u) to the product of the one-dimensional marginals
+    prod_k f_k(u_k). Where the marginals are high and the joint is empty, every
+    coordinate is ordinary and only their combination is missing — which is the
+    claim "these two literatures never combine their designs", stated as a
+    measurement rather than as an impression.
+
+    log f(u) - log prod_k f_k(u_k) is the pointwise mutual information of the
+    design axes, so the null is the obvious one: permute each axis independently
+    across rows. That destroys every joint structure while leaving all four
+    marginals, and hence the marginal-product field, exactly as observed. Only the
+    clearance field changes, so the test is specifically of the conjunction.
+
+    Returns the k best-supported empty combinations, their maximal boxes, and the
+    permutation p-value for the leading one.
+    """
+    axes = axes or cfg.axes
+    sigma = cfg.sigma if sigma is None else sigma
+    P, w, _ = matrix(df, axes)
+    n, d = P.shape
+    lin = [np.linspace(0, 1, grid)] * d
+    G = np.stack(np.meshgrid(*lin, indexing="ij"), -1).reshape(-1, d)
+    # The envelope, not the retired slope constraints. y >= floor(x) is entailed by
+    # the two ladders and fails on 2 of 108 rows, both flagged as off-ladder in their
+    # own scoring notes; leaving it off returns cells like (x=0.65, y=0), a sustained
+    # reach with no motor command issued, which is a hole in the parametrisation
+    # rather than in the literature. Independent of USE_FEASIBLE on purpose: the
+    # retired constraints are what that switch is about.
+    if mask:
+        G = G[feasible(G, axes, enabled=True)]
+
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:                              # pragma: no cover
+        cKDTree = None
+
+    def clearance(pts):
+        """Distance from every grid cell to the nearest paradigm."""
+        if cKDTree is not None:
+            return cKDTree(pts).query(G, k=1)[0]
+        return np.sqrt(((G[:, None, :] - pts[None, :, :]) ** 2).sum(-1)).min(1)
+
+    joint = np.zeros(len(G))
+    marg = np.ones(len(G))
+    for a in range(d):
+        m = np.zeros(len(G))
+        for p, wt in zip(P, w):
+            m += wt * np.exp(-(G[:, a] - p[a]) ** 2 / (2 * sigma ** 2))
+        marg *= m / w.sum()
+    for p, wt in zip(P, w):
+        joint += wt * np.exp(-((G - p) ** 2).sum(1) / (2 * sigma ** 2))
+    joint /= w.sum()
+    clear = clearance(P)
+    lift = np.log(joint + 1e-12) - np.log(marg + 1e-12)
+
+    empty = clear > min_clearance
+    if not empty.any():                       # nothing is that far from anything
+        return dict(table=pd.DataFrame(), grid=G, marg=marg, joint=joint,
+                    lift=lift, clear=clear, min_clearance=min_clearance,
+                    sigma=sigma, p=np.nan, null=np.array([]), axes=axes)
+
+    rows, chosen = [], []
+    for i in np.argsort(-np.where(empty, marg, -np.inf)):
+        if not empty[i]:
+            break
+        u = G[i]
+        if any(np.linalg.norm(u - c) < separation for c in chosen):
+            continue
+        chosen.append(u)
+        lo, hi = maximal_box(u, P, axes)
+        _, dist, near = reachability(u[None, :], P, cfg.sigma_reach)
+        sub = df.dropna(subset=axes)
+        rows.append(dict(
+            rank=len(chosen), support=float(marg[i]), joint=float(joint[i]),
+            lift=float(lift[i]), clearance=float(clear[i]),
+            volume=float(np.prod(hi - lo)),
+            nearest=str(sub["paradigm_id"].to_numpy()[near[0]]),
+            in_region=region_of(u, axes),
+            **{a: float(v) for a, v in zip(axes, u)},
+            **{f"{a}_lo": float(l) for a, l in zip(axes, lo)},
+            **{f"{a}_hi": float(h) for a, h in zip(axes, hi)}))
+        if len(chosen) == k:
+            break
+
+    # the null: axes shuffled independently, marginals preserved
+    rng = np.random.default_rng(seed)
+    obs = max(r["support"] for r in rows)
+    null = []
+    for _ in range(int(n_perm)):
+        Q = np.column_stack([P[rng.permutation(n), a] for a in range(d)])
+        m = clearance(Q) > min_clearance
+        null.append(marg[m].max() if m.any() else 0.0)
+    null = np.asarray(null)
+    p = float((1 + (null >= obs).sum()) / (1 + len(null))) if len(null) else np.nan
+
+    return dict(table=pd.DataFrame(rows), grid=G, marg=marg, joint=joint,
+                lift=lift, clear=clear, min_clearance=min_clearance,
+                sigma=sigma, p=p, null=null, obs=obs, axes=axes)
+
+
+def combination_sweep(df, cfg, clearances=(0.25, 0.30, 0.35, 0.40),
+                      sigmas=(0.09, 0.12), grid=21, n_perm=100):
+    """The leading unexplored combination as its two free parameters move.
+
+    A gap found at one bandwidth and one clearance threshold is a gap at those
+    settings, and the chapter has to say so. This is the table that says it.
+    """
+    rows = []
+    for sg in sigmas:
+        for mc in clearances:
+            r = combination_gaps(df, cfg, k=1, grid=grid, sigma=sg,
+                                 min_clearance=mc, n_perm=n_perm)
+            if not len(r['table']):
+                rows.append(dict(sigma=sg, clearance=mc, top='none', p=np.nan))
+                continue
+            t = r['table'].iloc[0]
+            rows.append(dict(sigma=sg, clearance=mc, p=r['p'],
+                             top='(' + ', '.join(f'{t[a]:.2f}' for a in cfg.axes) + ')',
+                             support=float(t['support']), lift=float(t['lift'])))
+    return pd.DataFrame(rows)
+
+
+def region_of(u, axes):
+    """Which of the hand-specified REGIONS a point falls in, '-' for none."""
+    idx = {a: i for i, a in enumerate(axes)}
+    hit = []
+    for name, spec in REGIONS.items():
+        ok = True
+        for a, op, v in spec["constraints"]:
+            if a not in idx:
+                continue
+            ok &= (u[idx[a]] >= v - 1e-9) if op == ">=" else (u[idx[a]] <= v + 1e-9)
+        if ok:
+            hit.append(name)
+    return "+".join(hit) if hit else "—"
+
+
+def near_misses(df, target, cfg, k=6, axes=None):
+    """The published paradigms closest to a target design, and where each one fails.
+
+    The distance-based gap statistics answer "how far is this point from everything",
+    which in a 4-cube is answered by the corners. That question is the wrong one for a
+    region that is enclosed rather than remote: the target here has published work
+    roughly 0.43 away on three different sides, so no ball centred on it can grow, and
+    every ball-based method walks off to a corner instead.
+
+    This function reports the enclosure directly. For each of the k nearest paradigms
+    it gives the signed per-axis offset and names the axis carrying most of the
+    distance — the single design feature on which that paradigm misses. A target with
+    several near misses that each fail on a different axis is unexplored in a stronger
+    sense than one that is merely far from things: the literature has approached it
+    from several directions and stopped one axis short each time.
+    """
+    axes = axes or cfg.axes
+    sub = df.dropna(subset=axes).reset_index(drop=True)
+    P = sub[axes].to_numpy(float)
+    u = np.asarray(target, float)
+    delta = P - u
+    d = np.sqrt((delta ** 2).sum(1))
+    order = np.argsort(d)[:k]
+    rows = []
+    for i in order:
+        share = delta[i] ** 2 / max((delta[i] ** 2).sum(), 1e-12)
+        j = int(np.argmax(share))
+        rows.append(dict(paradigm_id=sub["paradigm_id"][i], cluster=sub["cluster"][i],
+                         distance=float(d[i]), fails_on=axes[j],
+                         fails_share=float(share[j]),
+                         **{a: float(v) for a, v in zip(axes, P[i])},
+                         **{f"d{a}": float(v) for a, v in zip(axes, delta[i])}))
+    return pd.DataFrame(rows)
+
+
+def fig_near_misses(df, target, cfg, ladders, out, k=5, stem="fig17_near_misses",
+                    target_label="thesis design"):
+    """One column per axis, one row per paradigm: how close the literature gets.
+
+    Read across a row and you see a single published paradigm on all four axes; the
+    red segment is the axis carrying most of its distance from the target. Read down a
+    column and you see how close the literature gets on that one feature. The point of
+    the panel is the contrast between the two readings: every column has near
+    neighbours, and no row is close in all of them.
+    """
+    axes = cfg.axes
+    tab = near_misses(df, target, cfg, k=k, axes=axes)
+    if not len(tab):
+        return tab
+    names = list(tab["paradigm_id"])
+    ypos = np.arange(len(names))[::-1]
+    fig, axs = plt.subplots(1, len(axes), figsize=(PANEL_W * len(axes) + 1.9,
+                                                   0.42 * len(names) + 1.5),
+                            sharey=True)
+    for ax, a in zip(np.atleast_1d(axs), axes):
+        tv = float(target[axes.index(a)])
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.7, len(names) - 0.3)
+        ax.axvline(tv, color="#B5341F", lw=1.0, zorder=1, alpha=0.85)
+        for yy, (_, r) in zip(ypos, tab.iterrows()):
+            miss = (r["fails_on"] == a)
+            col = "#B5341F" if miss else GREY
+            ax.plot([tv, r[a]], [yy, yy], color=col, lw=2.0 if miss else 0.9,
+                    alpha=0.95 if miss else 0.6, zorder=2, solid_capstyle="round")
+            ax.plot([r[a]], [yy], "o", ms=4.6 if miss else 3.2, color=col,
+                    mec="white", mew=0.5, zorder=3)
+            if miss:
+                ax.annotate(f"{r[a] - tv:+.2f}", (r[a], yy), fontsize=5.9,
+                            color="#B5341F", ha="center", va="bottom",
+                            xytext=(0, 4), textcoords="offset points")
+        ax.plot([tv], [len(names) - 0.55], marker="*", ms=7.5, color="#B5341F",
+                mec="white", mew=0.4, clip_on=False, zorder=4)
+        ax.set_xticks([0, 0.5, 1])
+        ax.set_title(label_of(a, ladders, short=True), fontsize=7.4, pad=9)
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.tick_params(axis="y", length=0)
+    a0 = np.atleast_1d(axs)[0]
+    a0.set_yticks(ypos)
+    a0.set_yticklabels(names, fontsize=6.5)
+    fig.suptitle(f"the {len(tab)} published paradigms nearest the {target_label} "
+                 "(star)\nred: the axis carrying most of that paradigm's distance",
+                 fontsize=7.6, x=0.01, ha="left", y=1.03)
+    fig.tight_layout()
+    save(fig, out, stem)
+    return tab
+
+
+def leave_one_paper_out(df, cfg, target_box=None, grid=21, min_clearance=0.30,
+                        sigma=None, axes=None):
+    """How many papers would have to be rescored to move the leading combination gap.
+
+    A gap that survives dropping any one paper is a property of the corpus; one that
+    does not is a property of that paper. Every paper is removed in turn — all of its
+    paradigms at once, since rescoring is done per paper — and the leading unexplored
+    combination is recomputed. The fraction of drops that leave the answer inside the
+    same region is the number to quote.
+    """
+    axes = axes or cfg.axes
+    sub = df.dropna(subset=axes)
+    papers = sorted(sub["paper"].unique())
+    rows = []
+    for pid in papers:
+        rest = sub[sub["paper"] != pid]
+        r = combination_gaps(rest, cfg, k=1, grid=grid, sigma=sigma,
+                             min_clearance=min_clearance, n_perm=0, axes=axes)
+        if not len(r["table"]):
+            rows.append(dict(dropped=pid, n_rows=int((sub["paper"] == pid).sum()),
+                             top="none", inside=False))
+            continue
+        t = r["table"].iloc[0]
+        u = np.array([t[a] for a in axes])
+        inside = True
+        if target_box is not None:
+            inside = all(target_box[a][0] - 1e-9 <= t[a] <= target_box[a][1] + 1e-9
+                         for a in axes)
+        rows.append(dict(dropped=pid, n_rows=int((sub["paper"] == pid).sum()),
+                         top="(" + ", ".join(f"{v:.2f}" for v in u) + ")",
+                         support=float(t["support"]), inside=bool(inside)))
+    tab = pd.DataFrame(rows)
+    return dict(table=tab, n_papers=len(papers),
+                n_stable=int(tab["inside"].sum()),
+                share=float(tab["inside"].mean()) if len(tab) else np.nan)
 
 
 def account_matrix(sub):
@@ -1434,9 +1814,38 @@ def bootstrap_stability(X, w, k, n_boot=60, seed=0, method="kmeans"):
     # 1 = every pair always agrees, 0.5 = coin flip
     return float(np.mean(np.maximum(v, 1 - v)))
 
-def cluster_corpus(df, cfg, k=2, method="ward", 
-                   axes=None, sweep=range(2, 9), out=None):
-    """Cluster the corpus without looking at the labels, then compare to them."""
+TASK_AXES = ["x", "y", "x1", "y1"]      # what the participant has to do
+EVENT_AXES = ["z", "t", "s"]            # what happens to them
+
+
+def cluster_corpus(df, cfg, k=2, method="ward",
+                   axes=None, sweep=range(2, 9), out=None, scale="z"):
+    """Cluster the corpus without looking at the labels, then compare to them.
+
+    `scale` decides what "equal contribution to the distance" means, and the choice
+    is not innocent here.
+
+      z      each axis divided by its standard deviation in this corpus. Standard
+             when units differ. These axes do not differ in units: every one is a
+             rung ladder normalised to [0, 1] by construction, so dividing by the
+             observed spread does not remove an arbitrary scale, it re-weights the
+             axes by how bimodal the corpus happens to be on each. t is the most
+             bimodal axis in the workbook (var 0.134, two to three times x, y or z,
+             with 34 rows at 0 and 27 at 0.83 or above) and the least informative
+             about the split the chapter is about (Hedges g between the motor and
+             surprise files: x +1.55, y +0.97, z -0.57, t -0.06). Standardising
+             therefore promotes the one axis that does not separate the traditions
+             into the axis that dominates the tree.
+      raw    the ladders as coded, each contributing its own [0, 1] range.
+      block  raw, then each axis divided by sqrt(the number of axes in its block),
+             so the task block and the event block carry equal total weight
+             regardless of how many axes each contributes. Use when the axis list is
+             unbalanced (x,y,z,t,s,x1,y1 gives the task block four axes and the
+             event block three).
+
+    None of the three is the right answer on its own; the chapter should report the
+    partition under all three and say which claims survive. --cluster-scale.
+    """
     axes = axes or cfg.axes
     
     # 1. Fill missing values on secondary axes so rows aren't dropped prematurely
@@ -1455,13 +1864,33 @@ def cluster_corpus(df, cfg, k=2, method="ward",
     print("\nStandard deviation:")
     print(sub[axes].std())
 
-    # 2. Standardize features to unit variance so t does not overpower s, x1, y1
-    std_devs = np.std(X_raw, axis=0)
-    std_devs[std_devs == 0] = 1.0  # prevent division by zero
-    X = (X_raw - np.mean(X_raw, axis=0)) / std_devs
+    # 2. Put the axes on a common footing. See the docstring: on a corpus of rung
+    #    ladders the three options below are genuinely different claims about what
+    #    an equal contribution is, not three spellings of the same normalisation.
+    mu_raw = np.mean(X_raw, axis=0)
+    if scale == "z":
+        std_devs = np.std(X_raw, axis=0)
+        std_devs[std_devs == 0] = 1.0
+        X = (X_raw - mu_raw) / std_devs
+    elif scale == "raw":
+        std_devs = np.ones(X_raw.shape[1])
+        X = X_raw - mu_raw
+    elif scale == "block":
+        nt = max(sum(a in TASK_AXES for a in axes), 1)
+        ne = max(sum(a in EVENT_AXES for a in axes), 1)
+        std_devs = np.array([np.sqrt(nt) if a in TASK_AXES else
+                             (np.sqrt(ne) if a in EVENT_AXES else 1.0)
+                             for a in axes])
+        X = (X_raw - mu_raw) / std_devs
+    else:
+        raise SystemExit(f"unknown --cluster-scale: {scale}")
 
-    print("\n=== Clustering axis statistics (Standardized) ===")
+    print(f"\n=== Clustering axis statistics ({scale}) ===")
     print(pd.DataFrame(X, columns=axes).describe().T)
+    print("axis weights (1 / divisor): " +
+          ", ".join(f"{a} {1 / s:.2f}" for a, s in zip(axes, std_devs)))
+    print(f"coordinate ties: {len(sub.groupby(axes))} distinct points over "
+          f"{len(sub)} rows — every partition metric below is capped by this")
 
     w = sub["w"].to_numpy(float)
 
@@ -1541,7 +1970,8 @@ def cluster_corpus(df, cfg, k=2, method="ward",
                                                         method=method)))
                           
     return dict(sub=sub, X=X, X_raw=X_raw, mu=mu, sd=std_devs, w=w, axes=axes,
-                k=k, method=method, labels=lab,
+                k=k, method=method, labels=lab, scale=scale,
+                n_distinct=len(sub.groupby(axes)),
                 centers=C_raw, centers_z=C,
                 given=given, contingency=M, found_names=ua, given_names=ub,
                 agreement=agree, mapping=mapping, ari=ari, p_ari=p_ari,
@@ -5682,6 +6112,41 @@ def report(df, raw, cfg, gaps, counts, mean_disp, f_thesis, n_eff, corr, path,
                 add("      box: " + ", ".join(
                     f"{a} [{rr[f'{a}_lo']:.2f}, {rr[f'{a}_hi']:.2f}]"
                     for a in cfg.axes))
+        cb = empty.get("combo")
+        if cb is not None and len(cb["table"]):
+            add("")
+            add("gaps, method 4: unexplored combinations of well-explored values")
+            add("  methods 1-3 all rank a point by how far it is from the corpus, and")
+            add("  in a 4-cube the farthest points are the corners whether or not an")
+            add("  experiment could be run there. This method compares the joint")
+            add("  density to the product of the four marginals: a cell scores highly")
+            add("  when every one of its coordinates is ordinary in the literature and")
+            add("  only their conjunction is missing. It does not use the feasibility")
+            add("  mask, so it does not inherit the constraint the ladders contradict.")
+            add(f"  cells must be at least {cb['min_clearance']:.2f} from every "
+                f"paradigm; sigma = {cb['sigma']:.2f}")
+            add(f"  leading combination's marginal support {cb['obs']:.4f} against "
+                f"{np.median(cb['null']):.4f} for axes permuted independently "
+                f"(p = {cb['p']:.4f})")
+            for _, rr in cb["table"].iterrows():
+                add(f"  combination {int(rr['rank'])}: ("
+                    + ", ".join(f"{rr[a]:.2f}" for a in cfg.axes)
+                    + f")  support {rr['support']:.4f}  log-lift {rr['lift']:+.2f}"
+                    + f"  clearance {rr['clearance']:.2f}  region {rr['in_region']}")
+                add("      box: " + ", ".join(
+                    f"{a} [{rr[f'{a}_lo']:.2f}, {rr[f'{a}_hi']:.2f}]"
+                    for a in cfg.axes) + f"   nearest {rr['nearest']}")
+            sw = empty.get("combo_sweep")
+            if sw is not None and len(sw):
+                add("  the leading combination as the two free parameters move:")
+                for _, rr in sw.iterrows():
+                    add(f"    sigma {rr['sigma']:.2f}  clearance {rr['clearance']:.2f}"
+                        f"  ->  {rr['top']}  p = {rr['p']:.3f}")
+        if len(tab) > 1:
+            add("")
+            add("  how close the leading holes are to each other, since the chapter")
+            add("  reports one of them: radius " + ", ".join(
+                f"{r['radius']:.3f}" for _, r in tab.iterrows()))
         for i, r in tab.iterrows():
             add(f"  hole {i + 1}: centre ("
                 + ", ".join(f"{r[a]:.2f}" for a in cfg.axes)
@@ -6576,6 +7041,26 @@ def main(argv=None):
     ap.add_argument("--cluster-method", choices=["kmeans", "ward"], default="kmeans")
     ap.add_argument("--cluster-axes", default=None,
                     help="comma-separated axes to cluster on, e.g. x,y,z,t")
+    ap.add_argument("--cluster-scale", choices=["z", "raw", "block"], default="z",
+                    help="how the axes are put on a common footing before the "
+                         "distance is taken. 'z' divides by the corpus standard "
+                         "deviation (the old behaviour, which upweights t); 'raw' "
+                         "uses the rung ladders as coded, all already on [0,1]; "
+                         "'block' gives the task axes and the event axes equal "
+                         "total weight. Report all three")
+    ap.add_argument("--paper-weight", action="store_true",
+                    help="divide each row's confidence weight by the number of "
+                         "paradigms its paper contributes, so davis1939electrical "
+                         "(12 rows, 10 of them on one coordinate) counts once")
+    ap.add_argument("--corrections", default="",
+                    help="csv of auditable rescorings: paradigm_id,axis,value,reason")
+    ap.add_argument("--combination-grid", type=int, default=21,
+                    help="cells per axis for the combination-gap search (method 4)")
+    ap.add_argument("--combination-clearance", type=float, default=0.30,
+                    help="how far a cell must be from every paradigm to count as "
+                         "an unexplored combination")
+    ap.add_argument("--combination-perm", type=int, default=200,
+                    help="independent-axis permutations for the combination-gap null")
     ap.add_argument("--color-by", "--colour-by", dest="color_by",
                     choices=["found", "labelled"], default=COLOR_BY,
                     help="what the static figures are coloured by: 'found', the "
@@ -6645,7 +7130,8 @@ def main(argv=None):
     USE_FEASIBLE = args.feasible
     COLOR_BY = args.color_by
     cfg = Config(sigma=args.sigma, sigma_reach=args.sigma_reach, grid=args.grid,
-                 drop_lo=args.drop_lo, per_event=args.per_event)
+                 drop_lo=args.drop_lo, per_event=args.per_event,
+                 paper_weight=args.paper_weight, corrections=args.corrections)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -6687,7 +7173,8 @@ def main(argv=None):
     if args.clusters and args.clusters >= 2:
         cax = args.cluster_axes.split(",") if args.cluster_axes else cfg.axes
         clus = cluster_corpus(est, cfg, k=args.clusters, method=args.cluster_method,
-                              axes=[a.strip() for a in cax], out=out)
+                              axes=[a.strip() for a in cax], out=out,
+                              scale=args.cluster_scale)
     set_found_partition(clus)
     if args.color_by == "found" and clus is None:
         print("--color-by found needs -k >= 2; colouring by the labels instead")
@@ -6751,6 +7238,18 @@ def main(argv=None):
     gapx = gap_intersection(est, cfg, lowd, empty, depth_frac=args.gap_depth,
                             quantile=args.gap_quantile)
     empty["gap"] = gapx
+    # method 4: unexplored combinations of well-explored values. Independent of the
+    # feasibility mask, so it is the one gap statistic the chapter can state without
+    # first defending a constraint the ladders contradict.
+    empty["combo"] = combination_gaps(est, cfg, k=args.holes,
+                                      grid=args.combination_grid,
+                                      min_clearance=args.combination_clearance,
+                                      n_perm=args.combination_perm)
+    if len(empty["combo"]["table"]):
+        empty["combo"]["table"].to_csv(out / "combination_gaps.csv", index=False)
+    empty["combo_sweep"] = combination_sweep(est, cfg, grid=args.combination_grid,
+                                             n_perm=max(50, args.combination_perm // 2))
+    empty["combo_sweep"].to_csv(out / "combination_sweep.csv", index=False)
     fig_density_levels(est, cfg, lowd, gapx, ladders, out)
     fig_regions_3d(est, cfg, lowd, gapx, ladders, out, overlay=over)
     fig_regions_3d(est, cfg, lowd, gapx, ladders, out, overlay=over,
