@@ -1380,6 +1380,137 @@ def leave_one_paper_out(df, cfg, target_box=None, grid=21, min_clearance=0.30,
                 share=float(tab["inside"].mean()) if len(tab) else np.nan)
 
 
+def largest_empty_boxes(df, cfg, k=6, grid=21, separation=0.55, axes=None,
+                        mask=True, held=None):
+    """The largest axis-aligned boxes containing no published paradigm.
+
+    Method 2 measures the largest empty *ball*. A ball is isotropic, so it can only
+    describe a hole that is equally deep in every direction, and it reports the radius
+    of the roundest hole it can find. The regions this review is about are not round.
+    G1 is wide in x and y and thin in t: a slab. No ball fits inside a slab, so a
+    ball-based search slides out of it and terminates at a corner of the cube, which is
+    why methods 1-3 keep reporting corners while the 3D plot plainly shows an empty
+    slab at high x, high y, low t.
+
+    A box has one half-width per axis and can therefore represent a slab exactly. Each
+    grid cell is a seed; the box starts as the whole cube and is shrunk by pushing back
+    the face nearest the offending paradigm until no paradigm remains inside. The
+    result is a maximal open box: every face touches a published paradigm, and those
+    paradigms are named, because they are the designs that bound the region and the
+    ones a new experiment has to differ from.
+
+    Ranked by volume. Volume is comparable across shapes in a way a radius is not, so a
+    thin wide slab and a compact ball compete on equal terms.
+    """
+    axes = axes or cfg.axes
+    d = len(axes)
+    sub = df.dropna(subset=axes).reset_index(drop=True)
+    P = sub[axes].to_numpy(float)
+    ids = sub["paradigm_id"].to_numpy()
+    lin = [np.linspace(0, 1, grid)] * d
+    G = np.stack(np.meshgrid(*lin, indexing="ij"), -1).reshape(-1, d)
+    if mask:
+        G = G[feasible(G, axes, enabled=True)]
+
+    boxes = []
+    for u in G:
+        lo = np.zeros(d)
+        hi = np.ones(d)
+        face_lo = [None] * d
+        face_hi = [None] * d
+        inside = np.all((P >= lo) & (P <= hi), axis=1)
+        while inside.any():
+            idx = np.where(inside)[0]
+            off = np.abs(P[idx] - u)
+            i, a = np.unravel_index(np.argmax(off), off.shape)
+            j = idx[i]
+            if P[j, a] > u[a]:
+                hi[a] = P[j, a] - 1e-9
+                face_hi[a] = ids[j]
+            else:
+                lo[a] = P[j, a] + 1e-9
+                face_lo[a] = ids[j]
+            inside = np.all((P >= lo) & (P <= hi), axis=1)
+        boxes.append((float(np.prod(hi - lo)), lo.copy(), hi.copy(),
+                      list(face_lo), list(face_hi)))
+
+    order = np.argsort([-b[0] for b in boxes])
+    rows, seen = [], []
+
+    def _overlap(a_lo, a_hi, b_lo, b_hi):
+        """Intersection over union of two boxes.
+
+        Near-duplicates used to be suppressed by the distance between box centres,
+        which is measured in coordinate units and therefore changes if the axes are
+        rescaled. Volume ranking is invariant to a per-axis rescaling — every box's
+        volume is multiplied by the same constant — so the suppression rule has to be
+        invariant too, or the reported list silently depends on the normalisation
+        while the underlying ranking does not. Overlap is a ratio of volumes and
+        cancels the scale factors exactly.
+        """
+        inter = np.prod(np.maximum(0.0, np.minimum(a_hi, b_hi) - np.maximum(a_lo, b_lo)))
+        union = np.prod(a_hi - a_lo) + np.prod(b_hi - b_lo) - inter
+        return inter / union if union > 0 else 0.0
+
+    for j in order:
+        vol, lo, hi, flo, fhi = boxes[j]
+        if any(_overlap(lo, hi, s_lo, s_hi) > separation for s_lo, s_hi in seen):
+            continue
+        seen.append((lo.copy(), hi.copy()))
+        centre = (lo + hi) / 2
+        rec = dict(rank=len(seen), volume=vol, in_region=region_of(centre, axes),
+                   **{f"{a}_lo": float(l) for a, l in zip(axes, lo)},
+                   **{f"{a}_hi": float(h) for a, h in zip(axes, hi)},
+                   faces="; ".join(
+                       f"{a}: {flo[i] or 'edge'} / {fhi[i] or 'edge'}"
+                       for i, a in enumerate(axes)))
+        if held is not None and len(held):
+            H = held.dropna(subset=axes)[axes].to_numpy(float)
+            rec["held_inside"] = int(np.all((H >= lo) & (H <= hi), axis=1).sum())
+            rec["held_total"] = int(len(H))
+        rows.append(rec)
+        if len(seen) == k:
+            break
+    return pd.DataFrame(rows)
+
+
+def region_occupancy_test(df, cfg, lo, hi, axes=None, n_perm=5000, seed=0):
+    """Is a region emptier than the axes' own marginals predict?
+
+    Every other method here searches: it sweeps the cube and reports whichever region
+    wins some criterion. Search is the weaker instrument, because a region defined
+    after looking has no null, and because winning a competition against regions nobody
+    proposed is not evidence about the region someone did propose. G1 and G2 were
+    written down before the corpus was scored, which makes them hypotheses, and a
+    hypothesis can be tested rather than rediscovered.
+
+    The test is occupancy. Under the null the four axes are shuffled independently
+    across rows, which keeps every marginal exactly as observed — the same 34 paradigms
+    at x >= 0.67, the same 56 at t <= 0.17 — and destroys only the association between
+    them. The p-value is then the probability that a corpus with these marginals and no
+    axis coupling would leave the region as empty as it is. A significant result says
+    that the region's emptiness is a fact about how the literature *combines* design
+    features, not a by-product of any one axis being sparse at one end.
+    """
+    axes = axes or cfg.axes
+    sub = df.dropna(subset=axes)
+    P = sub[axes].to_numpy(float)
+    lo = np.asarray(lo, float)
+    hi = np.asarray(hi, float)
+    obs = int(np.all((P >= lo) & (P <= hi), axis=1).sum())
+    n = len(P)
+    rng = np.random.default_rng(seed)
+    null = np.empty(int(n_perm), int)
+    for b in range(int(n_perm)):
+        Q = np.column_stack([P[rng.permutation(n), a] for a in range(len(axes))])
+        null[b] = int(np.all((Q >= lo) & (Q <= hi), axis=1).sum())
+    inside = sub[np.all((P >= lo) & (P <= hi), axis=1)]
+    return dict(observed=obs, expected=float(null.mean()), sd=float(null.std()),
+                p=float((null <= obs).mean()), null=null,
+                occupants=list(inside["paradigm_id"]) if obs else [],
+                lo=lo, hi=hi, axes=axes, n=n)
+
+
 def account_matrix(sub):
     """Rows as distributions over ACCOUNTS, and a mask of the rows that carry one."""
     cols = [f"p_{a}" for a in ACCOUNTS]
@@ -3773,7 +3904,8 @@ def fig_density_levels(df, cfg, lowd, gap, ladders, out, plane=("y", "z")):
 # --- figure 16: the low-density regions and the gap, in three dimensions ----
 
 def fig_regions_3d(df, cfg, lowd, gap, ladders, out, overlay=None,
-                   trio=("x", "y", "z"), stem="fig16_regions_3d"):
+                   trio=("x", "y", "z"), stem="fig16_regions_3d",
+                   boxes=None, occupancy=None):
     """The regions of methods 3 and their intersection with depth, as volumes.
 
     Cells are drawn rather than surfaces: a connected component in four dimensions has
@@ -3791,12 +3923,54 @@ def fig_regions_3d(df, cfg, lowd, gap, ladders, out, overlay=None,
     if len(gap["table"]):
         g = gap["table"].iloc[0]
         panels.append(("deep and large · the gap", gap["mask"], g, "#C1425A"))
+
+    # Methods 1-3 return round or connected objects and can only draw those. The
+    # region this review is about is a slab, so it never appears in the panels above
+    # however the thresholds are set. These two panels draw it: the maximal empty box
+    # that contains the held-out designs, and the a priori region itself.
+    lin_ = lowd["lin"]
+
+    def _mask_from_box(row):
+        m = np.ones([len(lin_)] * len(axes), bool)
+        for k, ax_ in enumerate(axes):
+            keep = (lin_ >= row[f"{ax_}_lo"] - 1e-9) & (lin_ <= row[f"{ax_}_hi"] + 1e-9)
+            shape = [1] * len(axes)
+            shape[k] = len(lin_)
+            m &= keep.reshape(shape)
+        return m
+
+    if boxes is not None and len(boxes):
+        pick = boxes
+        if "held_inside" in boxes.columns and (boxes["held_inside"] > 0).any():
+            # the box that best covers the held-out designs, not merely the first
+            # box that touches any of them
+            pick = boxes.sort_values(["held_inside", "volume"], ascending=False)
+        row = pick.iloc[0].copy()
+        row["occupancy"] = 0
+        lbl = "method 5 · largest empty box"
+        if "held_inside" in row and row.get("held_total"):
+            lbl += f" ({int(row['held_inside'])}/{int(row['held_total'])} proposed inside)"
+        panels.append((lbl, _mask_from_box(row), row, "#1F6F4A"))
+
+    if occupancy:
+        for rname, res in occupancy.items():
+            row = {}
+            for k, ax_ in enumerate(axes):
+                row[f"{ax_}_lo"] = float(res["lo"][k])
+                row[f"{ax_}_hi"] = float(res["hi"][k])
+            row["volume"] = float(np.prod(res["hi"] - res["lo"]))
+            row["occupancy"] = int(res["observed"])
+            row = pd.Series(row)
+            panels.append((f"a priori {rname} · p = {res['p']:.3f}",
+                           _mask_from_box(row), row, "#B5341F"))
+            break
+
     if not panels:
         return
     a, b, c = trio
     ia, ib, ic = axes.index(a), axes.index(b), axes.index(c)
     rest = [k for k in range(len(axes)) if k not in (ia, ib, ic)]
-    fig = plt.figure(figsize=(3.6 * len(panels), 3.9))
+    fig = plt.figure(figsize=(3.35 * len(panels), 3.9))
     for i, (name, mask, row, col) in enumerate(panels):
         ax = fig.add_subplot(1, len(panels), i + 1, projection="3d")
         # collapse the fourth coordinate: a cell is drawn if the region reaches it at
@@ -3836,7 +4010,7 @@ def fig_regions_3d(df, cfg, lowd, gap, ladders, out, overlay=None,
         # appear inside it here while the hidden coordinate puts it outside; the
         # occupancy quoted is the four-dimensional count, which is the real one
         hidden = ", ".join(f"${axes[k]}$" for k in rest)
-        ax.set_title(f"{'ABC'[i]}  {name}\n{vol:.1f}% of the volume · "
+        ax.set_title(f"{chr(65 + i)}  {name}\n{vol:.1f}% of the volume · "
                      f"{int(row['occupancy'])} in the box"
                      + (f" · {hidden} not shown" if rest else ""),
                      fontsize=6.4, loc="left", pad=-2)
@@ -6112,6 +6286,41 @@ def report(df, raw, cfg, gaps, counts, mean_disp, f_thesis, n_eff, corr, path,
                 add("      box: " + ", ".join(
                     f"{a} [{rr[f'{a}_lo']:.2f}, {rr[f'{a}_hi']:.2f}]"
                     for a in cfg.axes))
+        bx = empty.get("boxes")
+        if bx is not None and len(bx):
+            add("")
+            add("gaps, method 5: largest empty axis-aligned boxes")
+            add("  method 2 reports the largest empty ball, and a ball is the same width in")
+            add("  every direction, so it can only describe a round hole. G1 is a slab: wide")
+            add("  in x and y, thin in t. No ball fits inside a slab, so a ball-based search")
+            add("  slides out of it and stops at a corner, which is why methods 1-3 keep")
+            add("  naming corners while the 3D plot shows an empty slab. A box has one")
+            add("  half-width per axis and represents a slab exactly. Every face of the box")
+            add("  below touches a published paradigm, and those are the designs a new")
+            add("  experiment has to differ from. Ranked by volume, which is comparable")
+            add("  across shapes in a way a radius is not.")
+            for _, rr in bx.iterrows():
+                _held = ""
+                if "held_inside" in rr:
+                    _held = f"   held-out rows inside {int(rr['held_inside'])}/{int(rr['held_total'])}"
+                add(f"  box {int(rr['rank'])}: volume {rr['volume']:.3f}   region {rr['in_region']}{_held}")
+                add("      " + ", ".join(
+                    f"{a} [{rr[f'{a}_lo']:.2f}, {rr[f'{a}_hi']:.2f}]" for a in cfg.axes))
+                add(f"      bounded by  {rr['faces']}")
+        oc = empty.get("occupancy")
+        if oc:
+            add("")
+            add("the a priori regions, tested rather than searched for")
+            add("  Every other method sweeps the cube and reports whichever region wins.")
+            add("  G1 and G2 were written down before the corpus was scored, so they can be")
+            add("  tested instead. The null shuffles the four axes independently across rows,")
+            add("  which preserves every marginal exactly and destroys only the coupling")
+            add("  between them; the p-value is the chance that a corpus with these marginals")
+            add("  and no coupling would leave the region this empty.")
+            for _rn, _r in oc.items():
+                add(f"  {_rn}: observed {_r['observed']} of {_r['n']}, "
+                    f"expected {_r['expected']:.2f} (sd {_r['sd']:.2f}) under independent axes, "
+                    f"p = {_r['p']:.4f}")
         cb = empty.get("combo")
         if cb is not None and len(cb["table"]):
             add("")
@@ -7059,6 +7268,12 @@ def main(argv=None):
     ap.add_argument("--combination-clearance", type=float, default=0.30,
                     help="how far a cell must be from every paradigm to count as "
                          "an unexplored combination")
+    ap.add_argument("--empty-box-grid", type=int, default=21,
+                    help="cells per axis for the largest-empty-box search (method 5)")
+    ap.add_argument("--boxes", type=int, default=6,
+                    help="how many maximal empty boxes to report")
+    ap.add_argument("--occupancy-perm", type=int, default=5000,
+                    help="independent-axis permutations for the region occupancy test")
     ap.add_argument("--combination-perm", type=int, default=200,
                     help="independent-axis permutations for the combination-gap null")
     ap.add_argument("--color-by", "--colour-by", dest="color_by",
@@ -7247,14 +7462,34 @@ def main(argv=None):
                                       n_perm=args.combination_perm)
     if len(empty["combo"]["table"]):
         empty["combo"]["table"].to_csv(out / "combination_gaps.csv", index=False)
+    # method 5: maximal empty boxes. A ball cannot fit inside a slab; a box can.
+    empty["boxes"] = largest_empty_boxes(est, cfg, k=args.boxes,
+                                         grid=args.empty_box_grid, held=held)
+    empty["boxes"].to_csv(out / "empty_boxes.csv", index=False)
+    # the a priori regions, tested rather than searched for
+    empty["occupancy"] = {}
+    for _rname, _spec in REGIONS.items():
+        _lo = np.zeros(len(cfg.axes)); _hi = np.ones(len(cfg.axes))
+        for _a, _op, _v in _spec["constraints"]:
+            if _a not in cfg.axes:
+                continue
+            _i = cfg.axes.index(_a)
+            if _op == ">=":
+                _lo[_i] = _v
+            else:
+                _hi[_i] = _v
+        empty["occupancy"][_rname] = region_occupancy_test(
+            est, cfg, _lo, _hi, n_perm=args.occupancy_perm)
     empty["combo_sweep"] = combination_sweep(est, cfg, grid=args.combination_grid,
                                              n_perm=max(50, args.combination_perm // 2))
     empty["combo_sweep"].to_csv(out / "combination_sweep.csv", index=False)
     fig_density_levels(est, cfg, lowd, gapx, ladders, out)
-    fig_regions_3d(est, cfg, lowd, gapx, ladders, out, overlay=over)
+    fig_regions_3d(est, cfg, lowd, gapx, ladders, out, overlay=over,
+                   boxes=empty.get("boxes"), occupancy=empty.get("occupancy"))
     fig_regions_3d(est, cfg, lowd, gapx, ladders, out, overlay=over,
                    trio=tuple(a.strip() for a in args.trio_alt.split(",")),
-                   stem="fig16b_regions_3d_t")
+                   stem="fig16b_regions_3d_t",
+                   boxes=empty.get("boxes"), occupancy=empty.get("occupancy"))
     if len(gapx["table"]):
         gapx["table"].to_csv(out / "gap_regions.csv", index=False)
     fig_empty_space(est, cfg, empty, ladders, out)
